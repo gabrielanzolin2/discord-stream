@@ -8,14 +8,14 @@ const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 3000;
 
-// Gerenciamento de Conexões e Usuários
+// Gerenciamento de Usuários e Salas
+const activeUsers = new Map(); // [userId -> { ws, nick, isLive, room }]
 const rooms = new Map();
-const activeUsers = new Map(); // [userId -> { ws, nick, isLive }]
 
 wss.on('connection', (ws) => {
-  let userRoom = 'sala-principal';
   let userId = null;
   let userNick = null;
+  let userRoom = 'sala-principal';
 
   ws.on('message', (message) => {
     try {
@@ -27,36 +27,55 @@ wss.on('connection', (ws) => {
         userNick = data.nick;
         userRoom = data.room || 'sala-principal';
 
-        activeUsers.set(userId, { ws, nick: userNick, isLive: false });
+        activeUsers.set(userId, { ws, nick: userNick, isLive: false, room: userRoom });
 
-        if (!rooms.has(userRoom)) {
-          rooms.set(userRoom, new Map());
-        }
+        if (!rooms.has(userRoom)) rooms.set(userRoom, new Map());
         rooms.get(userRoom).set(userId, ws);
 
         // Notifica membros da sala
-        broadcastToRoom(userRoom, userId, {
-          type: 'USER_JOINED',
-          userId,
-          nick: userNick
-        });
+        broadcastToRoom(userRoom, userId, { type: 'USER_JOINED', userId, nick: userNick });
 
-        // Envia lista de quem já está ao vivo na sala
+        // Envia lista de quem já está ao vivo
         const liveUsers = [];
-        for (const [id, client] of activeUsers) {
-          if (client.isLive && id !== userId) {
-            liveUsers.push({ userId: id, nick: client.nick });
-          }
+        for (const [id, u] of activeUsers) {
+          if (u.isLive && id !== userId) liveUsers.push({ userId: id, nick: u.nick });
         }
-        ws.send(JSON.stringify({ type: 'LIVE_LIST', liveUsers }));
+        ws.send(JSON.stringify({ type: 'SYNC_LIVE_USERS', liveUsers }));
       }
 
-      // 2. Transmissão Iniciada / Encerrada
+      // 2. Sistema de Pedido de Amizade (Estilo Discord)
+      if (data.type === 'FRIEND_REQUEST') {
+        const targetClient = activeUsers.get(data.targetId);
+        if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
+          targetClient.ws.send(JSON.stringify({
+            type: 'FRIEND_REQUEST_INCOMING',
+            fromId: userId,
+            fromNick: userNick
+          }));
+        } else {
+          ws.send(JSON.stringify({ type: 'FRIEND_NOT_FOUND', targetId: data.targetId }));
+        }
+      }
+
+      // 3. Resposta do Pedido de Amizade
+      if (data.type === 'FRIEND_RESPONSE') {
+        const targetClient = activeUsers.get(data.targetId);
+        if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
+          targetClient.ws.send(JSON.stringify({
+            type: 'FRIEND_RESPONSE_RESULT',
+            fromId: userId,
+            fromNick: userNick,
+            accepted: data.accepted
+          }));
+        }
+      }
+
+      // 4. Mudança de Estado de Transmissão (Ao Vivo)
       if (data.type === 'LIVE_STATE_CHANGE') {
         if (activeUsers.has(userId)) {
           activeUsers.get(userId).isLive = data.isLive;
         }
-        broadcastToRoom(userRoom, userId, {
+        broadcastToAll({
           type: 'USER_LIVE_STATE',
           userId,
           nick: userNick,
@@ -64,15 +83,16 @@ wss.on('connection', (ws) => {
         });
       }
 
-      // 3. Roteamento WebRTC (Offer, Answer, Candidates)
+      // 5. Sinalização WebRTC
       if (['OFFER', 'ANSWER', 'CANDIDATE', 'REQUEST_STREAM'].includes(data.type)) {
         const targetClient = activeUsers.get(data.target);
         if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
           targetClient.ws.send(JSON.stringify({ ...data, from: userId, fromNick: userNick }));
         }
       }
+
     } catch (err) {
-      console.error('Erro na mensagem WebSocket:', err);
+      console.error('Erro WebSocket:', err);
     }
   });
 
@@ -82,8 +102,8 @@ wss.on('connection', (ws) => {
       if (rooms.has(userRoom)) {
         rooms.get(userRoom).delete(userId);
         broadcastToRoom(userRoom, userId, { type: 'USER_LEFT', userId });
-        if (rooms.get(userRoom).size === 0) rooms.delete(userRoom);
       }
+      broadcastToAll({ type: 'USER_LIVE_STATE', userId, isLive: false });
     }
   });
 });
@@ -98,7 +118,15 @@ function broadcastToRoom(room, senderId, data) {
   }
 }
 
-// FRONTEND COMPLETO COM ALTO BITRATE E SISTEMA DE AMIGOS
+function broadcastToAll(data) {
+  for (const [, client] of activeUsers) {
+    if (client.ws.readyState === WebSocket.OPEN) {
+      client.ws.send(JSON.stringify(data));
+    }
+  }
+}
+
+// FRONTEND COMPLETO DO DISCORD
 app.get('/', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -106,7 +134,7 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Discord ScreenStream - High Bitrate GPU</title>
+  <title>Discord ScreenStream - Ultra 60FPS</title>
   <style>
     :root {
       --bg-tertiary: #1e1f22;
@@ -118,7 +146,6 @@ app.get('/', (req, res) => {
       --discord-red: #f23f43;
       --text-normal: #dbdee1;
       --text-muted: #949ba4;
-      --text-header: #ffffff;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; user-select: none; }
     body { background: var(--bg-tertiary); color: var(--text-normal); height: 100vh; display: flex; overflow: hidden; }
@@ -128,74 +155,95 @@ app.get('/', (req, res) => {
     .guild-icon { width: 48px; height: 48px; background: var(--discord-blurple); border-radius: 16px; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; cursor: pointer; transition: 0.2s; }
     .guild-icon:hover { border-radius: 12px; filter: brightness(1.1); }
 
-    /* BARRA 2: AMIGOS E CANAIS */
+    /* BARRA 2: AMIGOS */
     .sidebar { width: 280px; background: var(--bg-secondary); display: flex; flex-direction: column; }
     .sidebar-header { height: 48px; padding: 0 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid rgba(0,0,0,0.2); font-size: 14px; font-weight: bold; color: #fff; }
-    .btn-add-friend { background: var(--discord-green); color: #fff; border: none; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; cursor: pointer; }
+    .btn-add-friend { background: var(--discord-green); color: #fff; border: none; padding: 5px 10px; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; }
     .btn-add-friend:hover { filter: brightness(0.9); }
 
-    .friends-list { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 4px; }
-    .section-title { font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; padding: 8px 6px 4px 6px; letter-spacing: 0.5px; }
+    .friends-list { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+    .section-title { font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; padding: 6px 4px; letter-spacing: 0.5px; }
 
-    .friend-item { display: flex; align-items: center; justify-content: space-between; padding: 8px; border-radius: 6px; background: rgba(0,0,0,0.1); transition: 0.15s; }
+    .friend-item { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 6px; background: rgba(0,0,0,0.15); transition: 0.15s; }
     .friend-item:hover { background: rgba(255,255,255,0.06); }
     .friend-info { display: flex; align-items: center; gap: 8px; overflow: hidden; }
-    .avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--discord-blurple); display: flex; align-items: center; justify-content: center; font-weight: bold; color: #fff; font-size: 13px; flex-shrink: 0; position: relative; }
+    .avatar { width: 34px; height: 34px; border-radius: 50%; background: var(--discord-blurple); display: flex; align-items: center; justify-content: center; font-weight: bold; color: #fff; font-size: 13px; flex-shrink: 0; position: relative; }
     .status-dot { width: 9px; height: 9px; background: var(--discord-green); border-radius: 50%; position: absolute; bottom: 0; right: 0; border: 2px solid var(--bg-secondary); }
-    .friend-name { font-size: 13px; font-weight: 600; color: var(--text-normal); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .friend-name { font-size: 13px; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .friend-id { font-size: 11px; color: var(--text-muted); }
 
     .friend-actions { display: flex; gap: 4px; }
-    .btn-action { background: #1e1f22; border: none; color: #fff; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+    .btn-action { background: #1e1f22; border: none; color: #fff; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; cursor: pointer; }
+    .btn-action.live { background: var(--discord-red); animation: pulse 1.5s infinite; }
     .btn-action.watch { background: var(--discord-blurple); }
-    .btn-action.watch:hover { background: var(--discord-blurple-hover); }
     .btn-action.del:hover { background: var(--discord-red); }
+
+    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
 
     /* CARD DO USUÁRIO */
     .user-panel { margin-top: auto; height: 60px; background: #1e1f22; display: flex; align-items: center; padding: 0 12px; gap: 10px; border-top: 1px solid rgba(0,0,0,0.2); }
     .user-tag { display: flex; flex-direction: column; overflow: hidden; flex: 1; }
     .user-tag .username { font-size: 13px; font-weight: bold; color: #fff; }
-    .user-tag .peer-id { font-size: 11px; color: var(--discord-green); cursor: pointer; }
+    .user-tag .peer-id { font-size: 11px; color: var(--discord-green); cursor: pointer; font-weight: bold; }
     .user-tag .peer-id:hover { text-decoration: underline; }
 
-    /* PALCO PRINCIPAL (STREAM) */
+    /* PALCO PRINCIPAL */
     .main-stage { flex: 1; background: var(--bg-primary); display: flex; flex-direction: column; position: relative; }
     .top-bar { height: 48px; padding: 0 16px; display: flex; align-items: center; justify-content: space-between; background: var(--bg-secondary); border-bottom: 1px solid rgba(0,0,0,0.2); }
     .stream-info { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: bold; color: #fff; }
     .badge-live { background: var(--discord-red); color: white; font-size: 10px; font-weight: 800; padding: 2px 6px; border-radius: 4px; display: none; }
-    .badge-gpu { background: #232428; border: 1px solid var(--discord-green); color: var(--discord-green); font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px; display: flex; align-items: center; gap: 4px; }
+    .badge-gpu { background: #232428; border: 1px solid var(--discord-green); color: var(--discord-green); font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 4px; }
 
-    /* PLAYER DE VÍDEO */
-    .video-viewport { flex: 1; background: #000; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
-    video { width: 100%; height: 100%; object-fit: contain; transform: translateZ(0); will-change: transform; }
+    /* VÍDEO LIMPO NATIVO (SEM TELA PRETA) */
+    .video-viewport { flex: 1; background: #0b0c0e; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
+    video { width: 100%; height: 100%; max-width: 100%; max-height: 100%; object-fit: contain; background: transparent; }
 
     .empty-state { position: absolute; text-align: center; color: var(--text-muted); }
     .empty-state svg { width: 72px; height: 72px; fill: #4e5058; margin-bottom: 12px; }
 
-    /* CONTROLES FLUTUANTES */
+    /* DOCK FLUTUANTE */
     .control-dock { position: absolute; bottom: 24px; display: flex; align-items: center; gap: 10px; background: rgba(20,20,22,0.92); padding: 10px 20px; border-radius: 30px; backdrop-filter: blur(10px); }
-    .btn-dock { background: #313338; color: #fff; border: none; padding: 10px 18px; border-radius: 20px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+    .btn-dock { background: #313338; color: #fff; border: none; padding: 10px 18px; border-radius: 20px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 13px; }
     .btn-dock:hover { background: #3f4147; }
     .btn-dock.primary { background: var(--discord-blurple); }
     .btn-dock.danger { background: var(--discord-red); }
 
-    .bitrate-selector { background: #1e1f22; color: #fff; border: 1px solid #333; padding: 8px 12px; border-radius: 16px; font-size: 12px; font-weight: bold; outline: none; cursor: pointer; }
+    .bitrate-select { background: #1e1f22; color: #fff; border: 1px solid #333; padding: 8px 12px; border-radius: 16px; font-size: 12px; font-weight: bold; outline: none; cursor: pointer; }
 
     #unmuteNotice { position: absolute; top: 20px; background: rgba(0,0,0,0.85); border: 1px solid #f0b232; color: #f0b232; padding: 8px 18px; border-radius: 20px; font-weight: bold; font-size: 12px; cursor: pointer; display: none; z-index: 10; }
+
+    /* POP-UP DISCORD DE PEDIDO DE AMIZADE */
+    .discord-modal { position: fixed; top: 20px; right: 20px; background: #2b2d31; border: 1px solid var(--discord-blurple); border-radius: 8px; padding: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.6); display: none; flex-direction: column; gap: 10px; z-index: 9999; width: 300px; animation: slideIn 0.3s ease; }
+    @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    .discord-modal h4 { color: #fff; font-size: 14px; }
+    .discord-modal p { font-size: 12px; color: var(--text-muted); }
+    .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+    .btn-confirm { background: var(--discord-green); color: #fff; border: none; padding: 6px 12px; border-radius: 4px; font-weight: bold; cursor: pointer; }
+    .btn-reject { background: var(--discord-red); color: #fff; border: none; padding: 6px 12px; border-radius: 4px; font-weight: bold; cursor: pointer; }
   </style>
 </head>
 <body>
 
+  <!-- POP-UP DISCORD PEDIDO DE AMIZADE -->
+  <div class="discord-modal" id="friendRequestModal">
+    <h4>🔔 Pedido de Amizade!</h4>
+    <p id="friendRequestText">Alguém quer ser seu amigo.</p>
+    <div class="modal-actions">
+      <button class="btn-reject" onclick="respondFriendRequest(false)">Recusar</button>
+      <button class="btn-confirm" onclick="respondFriendRequest(true)">Aceitar</button>
+    </div>
+  </div>
+
   <!-- BARRA 1: SERVIDORES -->
   <div class="guild-bar">
-    <div class="guild-icon" title="Discord Stream GPU">DC</div>
+    <div class="guild-icon">DC</div>
   </div>
 
   <!-- BARRA 2: AMIGOS -->
   <div class="sidebar">
     <div class="sidebar-header">
       <span>AMIGOS</span>
-      <button class="btn-add-friend" onclick="promptAddFriend()">+ Adicionar</button>
+      <button class="btn-add-friend" onclick="sendFriendRequestPrompt()">+ Adicionar</button>
     </div>
 
     <div class="friends-list" id="friendsContainer">
@@ -218,9 +266,9 @@ app.get('/', (req, res) => {
       <div class="stream-info">
         <span id="stageTitle">Nenhuma transmissão em andamento</span>
         <span class="badge-live" id="liveBadge">AO VIVO</span>
-        <span class="badge-gpu" id="bitrateStatus">⚡ 60 FPS • 8.0 Mbps GPU</span>
+        <span class="badge-gpu" id="bitrateStatus">⚡ GPU 60 FPS • 8.0 Mbps</span>
       </div>
-      <span style="font-size: 12px; color: var(--discord-green);">🟢 Servidor em Nuvem Ativo</span>
+      <span style="font-size: 12px; color: var(--discord-green);" id="connStatusText">🟢 Nuvem Render Ativa</span>
     </div>
 
     <div class="video-viewport">
@@ -230,13 +278,12 @@ app.get('/', (req, res) => {
       <div class="empty-state" id="emptyState">
         <svg viewBox="0 0 24 24"><path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 1.99-.9 1.99-2L23 5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z"/></svg>
         <h3 style="color: #fff;">Pronto para transmitir</h3>
-        <p style="margin-top: 6px;">Transmita sua tela com aceleração por GPU e sem travamentos!</p>
+        <p style="margin-top: 6px;">Transmita sua tela em 60 FPS para seus amigos sem tela preta!</p>
       </div>
 
       <!-- DOCK FLUTUANTE -->
       <div class="control-dock">
-        <!-- Controle de Bitrate / Puxar Internet -->
-        <select class="bitrate-selector" id="bitrateSelect" onchange="updateBitrateSelection()">
+        <select class="bitrate-select" id="bitrateSelect" onchange="updateBitrateSelection()">
           <option value="8000">🔥 Ultra Fluido (8.0 Mbps - 60 FPS)</option>
           <option value="5000">⚡ Equilibrado (5.0 Mbps - 60 FPS)</option>
           <option value="2500">🍃 Leve (2.5 Mbps - 30 FPS)</option>
@@ -250,7 +297,7 @@ app.get('/', (req, res) => {
   </div>
 
   <script>
-    // --- IDENTIDADE & SALA ---
+    // --- IDENTIDADE LOCAL ---
     let myId = localStorage.getItem('dc_user_id');
     if (!myId) {
       myId = 'dc-' + Math.floor(10000 + Math.random() * 90000);
@@ -258,8 +305,10 @@ app.get('/', (req, res) => {
     }
     let myNick = localStorage.getItem('dc_user_nick') || 'Gamer#' + myId.slice(-4);
     let friends = JSON.parse(localStorage.getItem('dc_saved_friends') || '[]');
+    let liveFriendIds = new Set();
+    let pendingRequestFrom = null;
 
-    document.getElementById('myIdDisplay').innerText = myId + ' (Copiar ID)';
+    document.getElementById('myIdDisplay').innerText = myId + ' (Copiar)';
     document.getElementById('myNickDisplay').innerText = myNick;
     document.getElementById('avatarLetter').innerText = myNick.charAt(0).toUpperCase();
 
@@ -273,13 +322,20 @@ app.get('/', (req, res) => {
 
     let localStream = null;
     let isSharing = false;
-    let activePC = null; // Conexão ativa como espectador
-    let senderPCs = new Map(); // Conexões com amigos que estão me assistindo
 
-    // Servidores STUN + TURN Relay (Anti-CGNAT para longa distância)
+    // WebRTC: Conexões seguras com Fila de ICE
+    let activePC = null; // Quando estou assistindo
+    let activePCQueue = [];
+    let activePCRemoteReady = false;
+
+    let senderPCs = new Map(); // [viewerId -> RTCPeerConnection]
+    let senderQueues = new Map();
+    let senderRemoteReady = new Map();
+
     const rtcConfig = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
         { urls: 'stun:stun.cloudflare.com:3478' },
         { urls: 'stun:openrelay.metered.ca:80' },
         { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
@@ -287,7 +343,24 @@ app.get('/', (req, res) => {
       ]
     };
 
-    // --- CONEXÃO WEBSOCKET DO SERVIDOR ---
+    // Efeito Sonoro Discord (Web Audio API)
+    function playDiscordChime() {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
+        osc.frequency.setValueAtTime(880, ctx.currentTime + 0.12); // A5
+        gain.gain.setValueAtTime(0.2, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.35);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.35);
+      } catch (e) {}
+    }
+
+    // --- CONEXÃO WEBSOCKET ---
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(protocol + '//' + location.host);
 
@@ -298,39 +371,77 @@ app.get('/', (req, res) => {
     ws.onmessage = async (event) => {
       const data = JSON.parse(event.data);
 
-      // Amigo entrou ou solicitou tela
-      if ((data.type === 'USER_JOINED' || data.type === 'REQUEST_STREAM') && isSharing && localStream) {
-        initiateStreamToViewer(data.userId || data.from);
+      // PEDIDO DE AMIZADE RECEBIDO
+      if (data.type === 'FRIEND_REQUEST_INCOMING') {
+        playDiscordChime();
+        pendingRequestFrom = { id: data.fromId, nick: data.fromNick };
+        document.getElementById('friendRequestText').innerText = \`\${data.fromNick} (\${data.fromId}) quer ser seu amigo!\`;
+        document.getElementById('friendRequestModal').style.display = 'flex';
       }
 
-      if (data.type === 'USER_LIVE_STATE') {
+      // RESPOSTA DO PEDIDO DE AMIZADE
+      if (data.type === 'FRIEND_RESPONSE_RESULT') {
+        if (data.accepted) {
+          addFriendToLocal(data.fromId, data.fromNick);
+          alert(\`🎉 \${data.fromNick} aceitou seu pedido de amizade!\`);
+        } else {
+          alert(\`❌ \${data.fromNick} recusou o pedido de amizade.\`);
+        }
+      }
+
+      if (data.type === 'FRIEND_NOT_FOUND') {
+        alert("O ID " + data.targetId + " não foi encontrado online!");
+      }
+
+      // SINCRONIZAÇÃO DE TRANSMISSÃO
+      if (data.type === 'SYNC_LIVE_USERS') {
+        data.liveUsers.forEach(u => liveFriendIds.add(u.userId));
         renderFriends();
       }
 
-      // WebRTC: Recebendo chamada de amigo
+      if (data.type === 'USER_LIVE_STATE') {
+        if (data.isLive) liveFriendIds.add(data.userId);
+        else liveFriendIds.delete(data.userId);
+        renderFriends();
+      }
+
+      // SOLICITAÇÃO DE STREAM
+      if (data.type === 'REQUEST_STREAM' && isSharing && localStream) {
+        initiateStreamToViewer(data.from);
+      }
+
+      // WEBRTC SIGNALING
       if (data.type === 'OFFER') {
         handleIncomingOffer(data);
       }
 
       if (data.type === 'ANSWER') {
         const pc = senderPCs.get(data.from);
-        if (pc) await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        if (pc) {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          senderRemoteReady.set(data.from, true);
+          const queue = senderQueues.get(data.from) || [];
+          while (queue.length > 0) {
+            const c = queue.shift();
+            await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.warn);
+          }
+        }
       }
 
       if (data.type === 'CANDIDATE') {
-        const pc = activePC || senderPCs.get(data.from);
-        if (pc && pc.remoteDescription && data.candidate) {
-          await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(console.warn);
+        if (activePC) {
+          if (!activePCRemoteReady) activePCQueue.push(data.candidate);
+          else await activePC.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(console.warn);
+        } else if (senderPCs.has(data.from)) {
+          const pc = senderPCs.get(data.from);
+          const ready = senderRemoteReady.get(data.from);
+          if (!ready) senderQueues.get(data.from).push(data.candidate);
+          else await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(console.warn);
         }
       }
     };
 
-    // --- BOOST DE BITRATE E ACELERAÇÃO DE GPU NO SDP ---
-    function boostSDP(sdp, bitrateKbps = 8000) {
-      return sdp.replace(/a=mid:video\\r\\n/g, \`a=mid:video\\r\\nb=AS:\${bitrateKbps}\\r\\nb=TIAS:\${bitrateKbps * 1000}\\r\\n\`);
-    }
-
-    // --- TRANSMISSÃO DE ALTA PERFORMANCE (60 FPS + GPU) ---
+    // --- TRANSMISSÃO 60 FPS SEM TELA PRETA ---
     async function toggleShare() {
       if (isSharing) {
         stopShare();
@@ -339,14 +450,10 @@ app.get('/', (req, res) => {
 
       try {
         localStream = await navigator.mediaDevices.getDisplayMedia({
-          video: {
-            frameRate: { ideal: 60, max: 60 },
-            cursor: "always"
-          },
+          video: { frameRate: { ideal: 60, max: 60 }, cursor: "always" },
           audio: true
         });
 
-        // O SEGREDO DO 60 FPS SEM TRAVAR: Ativa prioridade de movimento para a GPU
         const videoTrack = localStream.getVideoTracks()[0];
         if (videoTrack && 'contentHint' in videoTrack) {
           videoTrack.contentHint = 'motion';
@@ -365,11 +472,10 @@ app.get('/', (req, res) => {
 
         videoTrack.onended = () => stopShare();
 
-        // Notifica o servidor que fiquei AO VIVO
         ws.send(JSON.stringify({ type: 'LIVE_STATE_CHANGE', isLive: true }));
 
       } catch (err) {
-        console.error('Falha ao iniciar tela:', err);
+        console.error('Erro ao capturar tela:', err);
       }
     }
 
@@ -380,6 +486,8 @@ app.get('/', (req, res) => {
       }
       senderPCs.forEach(pc => pc.close());
       senderPCs.clear();
+      senderQueues.clear();
+      senderRemoteReady.clear();
 
       isSharing = false;
       btnShare.innerText = 'Transmitir Tela';
@@ -392,28 +500,28 @@ app.get('/', (req, res) => {
       ws.send(JSON.stringify({ type: 'LIVE_STATE_CHANGE', isLive: false }));
     }
 
-    // Envia a tela com Bitrate elevado para quem assistir
     async function initiateStreamToViewer(viewerId) {
       const pc = new RTCPeerConnection(rtcConfig);
       senderPCs.set(viewerId, pc);
+      senderQueues.set(viewerId, []);
+      senderRemoteReady.set(viewerId, false);
 
       localStream.getTracks().forEach(track => {
         const sender = pc.addTrack(track, localStream);
 
-        // Desbloqueia Bitrate de 8 Mbps na placa de vídeo
-        if (track.kind === 'video' && sender.setParameters) {
-          setTimeout(async () => {
+        // Aplica o Bitrate de 8 Mbps assim que conectar, sem quebrar SDP
+        pc.addEventListener('connectionstatechange', async () => {
+          if (pc.connectionState === 'connected' && track.kind === 'video' && sender.setParameters) {
             try {
               const params = sender.getParameters();
               if (!params.encodings) params.encodings = [{}];
-              const selectedBitrate = parseInt(document.getElementById('bitrateSelect').value) * 1000;
-              params.encodings[0].maxBitrate = selectedBitrate;
-              params.encodings[0].networkPriority = 'high';
+              const b = parseInt(document.getElementById('bitrateSelect').value) * 1000;
+              params.encodings[0].maxBitrate = b;
               params.degradationPreference = 'maintain-framerate';
               await sender.setParameters(params);
-            } catch (e) { console.warn(e); }
-          }, 500);
-        }
+            } catch (e) {}
+          }
+        });
       });
 
       pc.onicecandidate = (e) => {
@@ -421,17 +529,16 @@ app.get('/', (req, res) => {
       };
 
       const offer = await pc.createOffer();
-      // Aplica o boost de banda na oferta SDP
-      const boostedSdp = boostSDP(offer.sdp, parseInt(document.getElementById('bitrateSelect').value));
-      await pc.setLocalDescription({ type: 'offer', sdp: boostedSdp });
+      await pc.setLocalDescription(offer);
 
       ws.send(JSON.stringify({ type: 'OFFER', target: viewerId, sdp: pc.localDescription }));
     }
 
-    // Recebe a tela do amigo com decodificação rápida
     async function handleIncomingOffer(data) {
       if (activePC) activePC.close();
       activePC = new RTCPeerConnection(rtcConfig);
+      activePCQueue = [];
+      activePCRemoteReady = false;
 
       activePC.ontrack = (event) => {
         if (videoEl.srcObject !== event.streams[0]) {
@@ -451,9 +558,15 @@ app.get('/', (req, res) => {
       };
 
       await activePC.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      activePCRemoteReady = true;
+
+      while (activePCQueue.length > 0) {
+        const c = activePCQueue.shift();
+        await activePC.addIceCandidate(new RTCIceCandidate(c)).catch(console.warn);
+      }
+
       const answer = await activePC.createAnswer();
-      const boostedAnswer = boostSDP(answer.sdp, parseInt(document.getElementById('bitrateSelect').value));
-      await activePC.setLocalDescription({ type: 'answer', sdp: boostedAnswer });
+      await activePC.setLocalDescription(answer);
 
       ws.send(JSON.stringify({ type: 'ANSWER', target: data.from, sdp: activePC.localDescription }));
     }
@@ -471,45 +584,45 @@ app.get('/', (req, res) => {
       unmuteNotice.style.display = 'none';
     }
 
-    // --- SISTEMA DE AMIGOS ---
-    function renderFriends() {
-      const container = document.getElementById('friendsContainer');
-      container.innerHTML = '<div class="section-title">Lista de Amigos</div>';
-
-      if (friends.length === 0) {
-        container.innerHTML += '<div style="font-size: 12px; color: var(--text-muted); padding: 8px;">Nenhum amigo adicionado ainda. Clique em "+ Adicionar".</div>';
+    // --- SISTEMA DE AMIZADES DISCORD ---
+    function sendFriendRequestPrompt() {
+      const targetId = prompt("Digite o ID do seu amigo (ex: dc-12345):");
+      if (!targetId) return;
+      if (targetId.trim() === myId) {
+        alert("Você não pode adicionar a si mesmo!");
         return;
       }
 
-      friends.forEach((f, idx) => {
-        const item = document.createElement('div');
-        item.className = 'friend-item';
-        item.innerHTML = \`
-          <div class="friend-info">
-            <div class="avatar">\${f.name.charAt(0).toUpperCase()}</div>
-            <div>
-              <div class="friend-name">\${f.name}</div>
-              <div class="friend-id">\${f.id}</div>
-            </div>
-          </div>
-          <div class="friend-actions">
-            <button class="btn-action watch" onclick="watchFriend('\${f.id}')" title="Assistir tela">📺 Assistir</button>
-            <button class="btn-action del" onclick="removeFriend(\${idx})" title="Remover">✕</button>
-          </div>
-        \`;
-        container.appendChild(item);
-      });
+      ws.send(JSON.stringify({
+        type: 'FRIEND_REQUEST',
+        targetId: targetId.trim()
+      }));
+
+      alert("Pedido de amizade enviado para " + targetId.trim() + "!");
     }
 
-    function promptAddFriend() {
-      const name = prompt("Nome do amigo (ex: Bruno):");
-      if (!name) return;
-      const id = prompt("Cole o ID do seu amigo (ex: dc-12345):");
-      if (!id) return;
+    function respondFriendRequest(accepted) {
+      document.getElementById('friendRequestModal').style.display = 'none';
+      if (!pendingRequestFrom) return;
 
-      friends.push({ name: name.trim(), id: id.trim() });
-      localStorage.setItem('dc_saved_friends', JSON.stringify(friends));
-      renderFriends();
+      ws.send(JSON.stringify({
+        type: 'FRIEND_RESPONSE',
+        targetId: pendingRequestFrom.id,
+        accepted
+      }));
+
+      if (accepted) {
+        addFriendToLocal(pendingRequestFrom.id, pendingRequestFrom.nick);
+      }
+      pendingRequestFrom = null;
+    }
+
+    function addFriendToLocal(id, name) {
+      if (!friends.some(f => f.id === id)) {
+        friends.push({ id, name });
+        localStorage.setItem('dc_saved_friends', JSON.stringify(friends));
+        renderFriends();
+      }
     }
 
     function removeFriend(idx) {
@@ -518,19 +631,49 @@ app.get('/', (req, res) => {
       renderFriends();
     }
 
-    function watchFriend(friendId) {
+    function renderFriends() {
+      const container = document.getElementById('friendsContainer');
+      container.innerHTML = '<div class="section-title">Lista de Amigos</div>';
+
+      if (friends.length === 0) {
+        container.innerHTML += '<div style="font-size: 12px; color: var(--text-muted); padding: 8px;">Nenhum amigo ainda. Clique em "+ Adicionar".</div>';
+        return;
+      }
+
+      friends.forEach((f, idx) => {
+        const isLive = liveFriendIds.has(f.id);
+        const item = document.createElement('div');
+        item.className = 'friend-item';
+        item.innerHTML = \`
+          <div class="friend-info">
+            <div class="avatar">\${f.name.charAt(0).toUpperCase()}<div class="status-dot"></div></div>
+            <div>
+              <div class="friend-name">\${f.name}</div>
+              <div class="friend-id">\${f.id}</div>
+            </div>
+          </div>
+          <div class="friend-actions">
+            \${isLive ? \`<button class="btn-action live" onclick="requestWatch('\${f.id}')">🔴 AO VIVO</button>\` : \`<button class="btn-action watch" onclick="requestWatch('\${f.id}')">Assistir</button>\`}
+            <button class="btn-action del" onclick="removeFriend(\${idx})">✕</button>
+          </div>
+        \`;
+        container.appendChild(item);
+      });
+    }
+
+    function requestWatch(friendId) {
       ws.send(JSON.stringify({ type: 'REQUEST_STREAM', target: friendId }));
     }
 
     function copyMyId() {
       navigator.clipboard.writeText(myId).then(() => {
-        alert("Seu ID foi copiado: " + myId + "\\nEnvie para o seu amigo te adicionar!");
+        alert("Seu ID copiado: " + myId + "\\nEnvie para seu amigo te adicionar!");
       });
     }
 
     function updateBitrateSelection() {
       const val = document.getElementById('bitrateSelect').value;
-      document.getElementById('bitrateStatus').innerText = \`⚡ 60 FPS • \${(val/1000).toFixed(1)} Mbps GPU\`;
+      document.getElementById('bitrateStatus').innerText = \`⚡ GPU 60 FPS • \${(val/1000).toFixed(1)} Mbps\`;
     }
 
     function unmute() {
@@ -551,5 +694,5 @@ app.get('/', (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log('Servidor em nuvem ativo na porta: ' + PORT);
+  console.log('Servidor Discord ativo na porta: ' + PORT);
 });
