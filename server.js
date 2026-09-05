@@ -5,15 +5,16 @@ const WebSocket = require('ws');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({
-  server,
-  maxPayload: 512 * 1024,
-  perMessageDeflate: false
-});
 
 const PORT = Number(process.env.PORT || 3000);
-const APP_VERSION = process.env.APP_VERSION || (process.env.RENDER_GIT_COMMIT ? process.env.RENDER_GIT_COMMIT.slice(0, 12) : '2026.09.04-ultra-1');
+const APP_VERSION = process.env.APP_VERSION || (process.env.RENDER_GIT_COMMIT ? process.env.RENDER_GIT_COMMIT.slice(0, 12) : '2026.09.04-ultra-2');
 const DEFAULT_ROOM = 'sala-principal';
+const MAX_VIEWERS_PER_STREAM = Math.max(2, Math.min(50, Number(process.env.MAX_VIEWERS_PER_STREAM || 8)));
+const STREAM_UPLOAD_BUDGET_BPS = Math.max(8_000_000, Number(process.env.STREAM_UPLOAD_BUDGET_BPS || 36_000_000));
+const WS_RATE_WINDOW_MS = 10_000;
+const WS_RATE_MAX_MESSAGES = Math.max(100, Number(process.env.WS_RATE_MAX_MESSAGES || 350));
+const RTC_CONFIG_RATE_LIMIT = Math.max(10, Number(process.env.RTC_CONFIG_RATE_LIMIT || 60));
+const FORCE_TURN_RELAY = String(process.env.FORCE_TURN_RELAY || '').toLowerCase() === 'true';
 
 const TURN_URLS = String(process.env.TURN_URLS || '')
   .split(',')
@@ -22,7 +23,13 @@ const TURN_URLS = String(process.env.TURN_URLS || '')
 const TURN_SECRET = String(process.env.TURN_SECRET || '').trim();
 const TURN_USERNAME = String(process.env.TURN_USERNAME || '').trim();
 const TURN_CREDENTIAL = String(process.env.TURN_CREDENTIAL || '').trim();
-const TURN_TTL_SECONDS = Math.max(300, Number(process.env.TURN_TTL_SECONDS || 86400));
+const ALLOW_STATIC_TURN_CREDENTIALS = String(process.env.ALLOW_STATIC_TURN_CREDENTIALS || '').toLowerCase() === 'true';
+const TURN_TTL_SECONDS = Math.max(300, Math.min(86400, Number(process.env.TURN_TTL_SECONDS || 3600)));
+
+const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(v => v.trim().replace(/\/$/, ''))
+  .filter(Boolean);
 
 const STUN_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -30,18 +37,63 @@ const STUN_SERVERS = [
   { urls: 'stun:stun.cloudflare.com:3478' }
 ];
 
+function isAllowedWebSocketOrigin(req) {
+  const origin = String(req.headers.origin || '').trim().replace(/\/$/, '');
+  if (!origin) return process.env.NODE_ENV !== 'production';
+
+  if (ALLOWED_ORIGINS.length > 0) {
+    return ALLOWED_ORIGINS.includes(origin);
+  }
+
+  try {
+    const originUrl = new URL(origin);
+    const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+    const host = forwardedHost || String(req.headers.host || '').trim();
+    return Boolean(host) && originUrl.host === host;
+  } catch (_) {
+    return false;
+  }
+}
+
+const wss = new WebSocket.Server({
+  server,
+  maxPayload: 384 * 1024,
+  perMessageDeflate: false,
+  verifyClient: ({ req }, done) => {
+    if (!isAllowedWebSocketOrigin(req)) {
+      done(false, 403, 'Origin not allowed');
+      return;
+    }
+    done(true);
+  }
+});
+
+app.set('trust proxy', 1);
 app.disable('x-powered-by');
 
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(self), display-capture=(self), fullscreen=(self)');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'none'");
+
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  if (req.secure || forwardedProto === 'https') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
   next();
 });
 
-// Gerenciamento de usuários e salas
-const activeUsers = new Map(); // userId -> { ws, nick, isLive, room, joinedAt }
+// Gerenciamento de usuários, salas e audiência
+const activeUsers = new Map(); // userId -> { ws, nick, isLive, room, joinedAt, sessionToken }
 const rooms = new Map();       // room -> Map(userId -> ws)
+const streamViewers = new Map(); // broadcasterId -> Map(viewerId -> { joinedAt })
+const viewerWatching = new Map(); // viewerId -> broadcasterId
+const disconnectGraceTimers = new Map();
+const rtcConfigRateBuckets = new Map();
 
 function normalizeId(value) {
   const id = String(value || '').trim().toLowerCase();
@@ -58,11 +110,44 @@ function normalizeNick(value) {
   return (nick || 'Gamer').slice(0, 48);
 }
 
+function normalizeSessionId(value) {
+  const id = String(value || '').trim();
+  return /^[a-zA-Z0-9_-]{8,128}$/.test(id) ? id : null;
+}
+
+function validDescription(value, expectedType) {
+  return Boolean(
+    value &&
+    typeof value === 'object' &&
+    value.type === expectedType &&
+    typeof value.sdp === 'string' &&
+    value.sdp.length > 0 &&
+    value.sdp.length <= 256 * 1024
+  );
+}
+
+function validCandidate(value) {
+  if (!value || typeof value !== 'object') return false;
+  if (typeof value.candidate !== 'string' || value.candidate.length > 8192) return false;
+  if (value.sdpMid != null && String(value.sdpMid).length > 128) return false;
+  return true;
+}
+
+function secureTokenEquals(a, b) {
+  const left = Buffer.from(String(a || ''));
+  const right = Buffer.from(String(b || ''));
+  return left.length > 0 && left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
 function safeSend(ws, payload) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   if (ws.bufferedAmount > 2 * 1024 * 1024) return false;
-  ws.send(JSON.stringify(payload));
-  return true;
+  try {
+    ws.send(JSON.stringify(payload));
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function getRoomClients(room) {
@@ -78,22 +163,166 @@ function broadcastToRoom(room, senderId, payload) {
   }
 }
 
+function getAudienceMap(broadcasterId) {
+  if (!streamViewers.has(broadcasterId)) streamViewers.set(broadcasterId, new Map());
+  return streamViewers.get(broadcasterId);
+}
+
+function audienceSnapshot(broadcasterId) {
+  const broadcaster = activeUsers.get(broadcasterId);
+  const audience = streamViewers.get(broadcasterId);
+  if (!audience) return [];
+
+  const viewers = [];
+  for (const [viewerId, meta] of audience) {
+    const viewer = activeUsers.get(viewerId);
+    if (!viewer) continue;
+    if (broadcaster && viewer.room !== broadcaster.room) continue;
+    viewers.push({
+      userId: viewerId,
+      nick: viewer.nick,
+      joinedAt: meta.joinedAt
+    });
+  }
+  viewers.sort((a, b) => a.joinedAt - b.joinedAt);
+  return viewers;
+}
+
+function sendAudienceSnapshot(broadcasterId) {
+  const viewers = audienceSnapshot(broadcasterId);
+  const payload = {
+    type: 'STREAM_AUDIENCE',
+    broadcasterId,
+    count: viewers.length,
+    maxViewers: MAX_VIEWERS_PER_STREAM,
+    viewers
+  };
+
+  const broadcaster = activeUsers.get(broadcasterId);
+  if (broadcaster) safeSend(broadcaster.ws, payload);
+
+  const audience = streamViewers.get(broadcasterId);
+  if (!audience) return;
+  for (const viewerId of audience.keys()) {
+    const viewer = activeUsers.get(viewerId);
+    if (viewer) safeSend(viewer.ws, payload);
+  }
+}
+
+function removeViewerFromStream(viewerId, notifyBroadcaster = true) {
+  const broadcasterId = viewerWatching.get(viewerId);
+  if (!broadcasterId) return null;
+
+  viewerWatching.delete(viewerId);
+  const audience = streamViewers.get(broadcasterId);
+  if (audience) {
+    audience.delete(viewerId);
+    if (audience.size === 0) streamViewers.delete(broadcasterId);
+  }
+
+  if (notifyBroadcaster) {
+    const broadcaster = activeUsers.get(broadcasterId);
+    if (broadcaster) {
+      safeSend(broadcaster.ws, {
+        type: 'STOP_WATCH',
+        from: viewerId
+      });
+    }
+  }
+
+  sendAudienceSnapshot(broadcasterId);
+  return broadcasterId;
+}
+
+function addViewerToStream(viewerId, broadcasterId) {
+  const currentBroadcaster = viewerWatching.get(viewerId);
+  if (currentBroadcaster && currentBroadcaster !== broadcasterId) {
+    removeViewerFromStream(viewerId, true);
+  }
+
+  const audience = getAudienceMap(broadcasterId);
+  if (!audience.has(viewerId) && audience.size >= MAX_VIEWERS_PER_STREAM) {
+    return false;
+  }
+
+  if (!audience.has(viewerId)) audience.set(viewerId, { joinedAt: Date.now() });
+  viewerWatching.set(viewerId, broadcasterId);
+  sendAudienceSnapshot(broadcasterId);
+  return true;
+}
+
+function endStreamAudience(broadcasterId, reason = 'ended') {
+  const audience = streamViewers.get(broadcasterId);
+  if (!audience) return;
+
+  for (const viewerId of audience.keys()) {
+    if (viewerWatching.get(viewerId) === broadcasterId) viewerWatching.delete(viewerId);
+    const viewer = activeUsers.get(viewerId);
+    if (viewer) {
+      safeSend(viewer.ws, {
+        type: 'STREAM_ENDED',
+        broadcasterId,
+        reason
+      });
+    }
+  }
+
+  streamViewers.delete(broadcasterId);
+  const broadcaster = activeUsers.get(broadcasterId);
+  if (broadcaster) {
+    safeSend(broadcaster.ws, {
+      type: 'STREAM_AUDIENCE',
+      broadcasterId,
+      count: 0,
+      maxViewers: MAX_VIEWERS_PER_STREAM,
+      viewers: []
+    });
+  }
+}
+
+function sameRoom(userA, userB) {
+  return Boolean(userA && userB && userA.room === userB.room);
+}
+
+function streamPeerAuthorized(fromId, targetId) {
+  return viewerWatching.get(fromId) === targetId || viewerWatching.get(targetId) === fromId;
+}
+
+function consumeWsRate(ws) {
+  const now = Date.now();
+  if (!ws.rateWindowStartedAt || now - ws.rateWindowStartedAt >= WS_RATE_WINDOW_MS) {
+    ws.rateWindowStartedAt = now;
+    ws.rateMessageCount = 0;
+  }
+  ws.rateMessageCount = (ws.rateMessageCount || 0) + 1;
+  return ws.rateMessageCount <= WS_RATE_MAX_MESSAGES;
+}
+
 wss.on('connection', (ws) => {
   let userId = null;
   let userNick = null;
   let userRoom = DEFAULT_ROOM;
 
   ws.isAlive = true;
+  ws.rateWindowStartedAt = Date.now();
+  ws.rateMessageCount = 0;
   ws.on('pong', () => { ws.isAlive = true; });
 
   safeSend(ws, {
     type: 'SERVER_HELLO',
     appVersion: APP_VERSION,
-    serverTime: Date.now()
+    serverTime: Date.now(),
+    maxViewers: MAX_VIEWERS_PER_STREAM
   });
 
   ws.on('message', (message) => {
     try {
+      if (!consumeWsRate(ws)) {
+        safeSend(ws, { type: 'ERROR', code: 'RATE_LIMITED' });
+        try { ws.close(1008, 'Rate limited'); } catch (_) {}
+        return;
+      }
+
       const data = JSON.parse(message.toString());
       if (!data || typeof data.type !== 'string') return;
 
@@ -114,18 +343,26 @@ wss.on('connection', (ws) => {
         userRoom = normalizeRoom(data.room);
         const isLive = Boolean(data.isLive);
 
+        const graceTimer = disconnectGraceTimers.get(userId);
+        if (graceTimer) {
+          clearTimeout(graceTimer);
+          disconnectGraceTimers.delete(userId);
+        }
+
         const previous = activeUsers.get(userId);
         if (previous && previous.ws !== ws) {
           safeSend(previous.ws, { type: 'SESSION_REPLACED' });
           try { previous.ws.close(4001, 'Session replaced'); } catch (_) {}
         }
 
+        const sessionToken = crypto.randomBytes(32).toString('base64url');
         activeUsers.set(userId, {
           ws,
           nick: userNick,
           isLive,
           room: userRoom,
-          joinedAt: Date.now()
+          joinedAt: Date.now(),
+          sessionToken
         });
 
         getRoomClients(userRoom).set(userId, ws);
@@ -148,13 +385,21 @@ wss.on('connection', (ws) => {
           userId,
           nick: userNick,
           room: userRoom,
-          appVersion: APP_VERSION
+          sessionToken,
+          appVersion: APP_VERSION,
+          maxViewers: MAX_VIEWERS_PER_STREAM,
+          streamUploadBudgetBps: STREAM_UPLOAD_BUDGET_BPS
         });
         safeSend(ws, { type: 'SYNC_LIVE_USERS', liveUsers });
+
+        if (isLive) sendAudienceSnapshot(userId);
+        const watchedBroadcaster = viewerWatching.get(userId);
+        if (watchedBroadcaster) sendAudienceSnapshot(watchedBroadcaster);
         return;
       }
 
-      if (!userId || activeUsers.get(userId)?.ws !== ws) return;
+      const currentUser = userId ? activeUsers.get(userId) : null;
+      if (!userId || !currentUser || currentUser.ws !== ws) return;
 
       if (data.type === 'FRIEND_REQUEST') {
         const targetId = normalizeId(data.targetId);
@@ -190,35 +435,111 @@ wss.on('connection', (ws) => {
       }
 
       if (data.type === 'LIVE_STATE_CHANGE') {
-        const current = activeUsers.get(userId);
-        if (current && current.ws === ws) current.isLive = Boolean(data.isLive);
+        const isLive = Boolean(data.isLive);
+        currentUser.isLive = isLive;
+
+        if (!isLive) endStreamAudience(userId, 'broadcaster_stopped');
 
         broadcastToRoom(userRoom, userId, {
           type: 'USER_LIVE_STATE',
           userId,
           nick: userNick,
-          isLive: Boolean(data.isLive)
+          isLive
         });
         return;
       }
 
-      if (['OFFER', 'ANSWER', 'CANDIDATE', 'REQUEST_STREAM', 'STOP_WATCH'].includes(data.type)) {
+      if (data.type === 'REQUEST_STREAM') {
         const targetId = normalizeId(data.target);
         if (!targetId || targetId === userId) return;
 
-        const targetClient = activeUsers.get(targetId);
-        if (!targetClient) {
-          if (data.type === 'REQUEST_STREAM') {
-            safeSend(ws, { type: 'STREAM_NOT_FOUND', targetId });
-          }
+        const broadcaster = activeUsers.get(targetId);
+        if (!broadcaster || !broadcaster.isLive || !sameRoom(currentUser, broadcaster)) {
+          safeSend(ws, { type: 'STREAM_NOT_FOUND', targetId });
           return;
         }
 
-        safeSend(targetClient.ws, {
-          ...data,
+        if (!addViewerToStream(userId, targetId)) {
+          safeSend(ws, {
+            type: 'STREAM_FULL',
+            targetId,
+            maxViewers: MAX_VIEWERS_PER_STREAM
+          });
+          return;
+        }
+
+        safeSend(broadcaster.ws, {
+          type: 'REQUEST_STREAM',
           from: userId,
-          fromNick: userNick
+          fromNick: userNick,
+          forceRelay: Boolean((data.forceRelay || FORCE_TURN_RELAY) && TURN_URLS.length)
         });
+        return;
+      }
+
+      if (data.type === 'STOP_WATCH') {
+        const targetId = normalizeId(data.target);
+        const actualBroadcaster = viewerWatching.get(userId);
+        if (!actualBroadcaster) return;
+        if (targetId && targetId !== actualBroadcaster) return;
+        removeViewerFromStream(userId, true);
+        return;
+      }
+
+      if (data.type === 'OFFER') {
+        const targetId = normalizeId(data.target);
+        const sessionId = normalizeSessionId(data.sessionId);
+        const targetClient = targetId ? activeUsers.get(targetId) : null;
+        if (!targetId || !targetClient || !sameRoom(currentUser, targetClient)) return;
+        if (viewerWatching.get(targetId) !== userId) return;
+        if (!sessionId || !validDescription(data.sdp, 'offer')) return;
+
+        safeSend(targetClient.ws, {
+          type: 'OFFER',
+          from: userId,
+          fromNick: userNick,
+          sessionId,
+          sdp: data.sdp,
+          quality: data.quality && typeof data.quality === 'object' ? data.quality : undefined,
+          forceRelay: Boolean(data.forceRelay)
+        });
+        return;
+      }
+
+      if (data.type === 'ANSWER') {
+        const targetId = normalizeId(data.target);
+        const sessionId = normalizeSessionId(data.sessionId);
+        const targetClient = targetId ? activeUsers.get(targetId) : null;
+        if (!targetId || !targetClient || !sameRoom(currentUser, targetClient)) return;
+        if (viewerWatching.get(userId) !== targetId) return;
+        if (!sessionId || !validDescription(data.sdp, 'answer')) return;
+
+        safeSend(targetClient.ws, {
+          type: 'ANSWER',
+          from: userId,
+          fromNick: userNick,
+          sessionId,
+          sdp: data.sdp
+        });
+        return;
+      }
+
+      if (data.type === 'CANDIDATE') {
+        const targetId = normalizeId(data.target);
+        const sessionId = normalizeSessionId(data.sessionId);
+        const targetClient = targetId ? activeUsers.get(targetId) : null;
+        if (!targetId || !targetClient || !sameRoom(currentUser, targetClient)) return;
+        if (!streamPeerAuthorized(userId, targetId)) return;
+        if (!sessionId || !validCandidate(data.candidate)) return;
+
+        safeSend(targetClient.ws, {
+          type: 'CANDIDATE',
+          from: userId,
+          fromNick: userNick,
+          sessionId,
+          candidate: data.candidate
+        });
+        return;
       }
     } catch (err) {
       console.error('Erro WebSocket:', err.message);
@@ -244,13 +565,23 @@ wss.on('connection', (ws) => {
       if (roomClients.size === 0) rooms.delete(userRoom);
     }
 
-    broadcastToRoom(userRoom, userId, { type: 'USER_LEFT', userId });
-    broadcastToRoom(userRoom, userId, {
-      type: 'USER_LIVE_STATE',
-      userId,
-      nick: userNick,
-      isLive: false
-    });
+    const cleanupTimer = setTimeout(() => {
+      disconnectGraceTimers.delete(userId);
+      if (activeUsers.has(userId)) return;
+
+      if (viewerWatching.has(userId)) removeViewerFromStream(userId, true);
+      if (streamViewers.has(userId)) endStreamAudience(userId, 'broadcaster_offline');
+
+      broadcastToRoom(userRoom, userId, { type: 'USER_LEFT', userId });
+      broadcastToRoom(userRoom, userId, {
+        type: 'USER_LIVE_STATE',
+        userId,
+        nick: userNick,
+        isLive: false
+      });
+    }, 5000);
+
+    disconnectGraceTimers.set(userId, cleanupTimer);
   });
 });
 
@@ -267,12 +598,37 @@ const wsHeartbeat = setInterval(() => {
 
 wss.on('close', () => clearInterval(wsHeartbeat));
 
+function consumeRtcConfigRate(req) {
+  const key = String(req.ip || req.socket.remoteAddress || 'unknown');
+  const now = Date.now();
+  let bucket = rtcConfigRateBuckets.get(key);
+  if (!bucket || now - bucket.startedAt >= 60_000) {
+    bucket = { startedAt: now, count: 0 };
+    rtcConfigRateBuckets.set(key, bucket);
+  }
+  bucket.count += 1;
+  return bucket.count <= RTC_CONFIG_RATE_LIMIT;
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - 5 * 60_000;
+  for (const [key, bucket] of rtcConfigRateBuckets) {
+    if (bucket.startedAt < cutoff) rtcConfigRateBuckets.delete(key);
+  }
+}, 60_000).unref?.();
+
 app.get('/health', (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.json({
     ok: true,
     appVersion: APP_VERSION,
     usersOnline: activeUsers.size,
+    activeStreams: Array.from(activeUsers.values()).filter((u) => u.isLive).length,
+    activeViewers: viewerWatching.size,
+    maxViewersPerStream: MAX_VIEWERS_PER_STREAM,
+    forceTurnRelay: FORCE_TURN_RELAY,
+    turnConfigured: Boolean(TURN_URLS.length && (TURN_SECRET || (ALLOW_STATIC_TURN_CREDENTIALS && TURN_USERNAME && TURN_CREDENTIAL))),
+    turnTlsEndpointConfigured: TURN_URLS.some((url) => /^turns:/i.test(url)),
     uptimeSeconds: Math.floor(process.uptime())
   });
 });
@@ -283,14 +639,38 @@ app.get('/api/version', (req, res) => {
 });
 
 app.get('/api/rtc-config', (req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Cache-Control', 'no-store, private');
+
+  if (!consumeRtcConfigRate(req)) {
+    res.setHeader('Retry-After', '60');
+    res.status(429).json({ error: 'RATE_LIMITED' });
+    return;
+  }
 
   const iceServers = [...STUN_SERVERS];
+  const userId = normalizeId(req.query.userId);
   let turnMode = 'none';
+  let expiresAt = null;
 
-  if (TURN_URLS.length && TURN_SECRET) {
-    const userId = normalizeId(req.query.userId) || 'guest';
-    const expiresAt = Math.floor(Date.now() / 1000) + TURN_TTL_SECONDS;
+  const hasEphemeralTurn = Boolean(TURN_URLS.length && TURN_SECRET);
+  const hasStaticTurn = Boolean(
+    TURN_URLS.length &&
+    ALLOW_STATIC_TURN_CREDENTIALS &&
+    TURN_USERNAME &&
+    TURN_CREDENTIAL
+  );
+
+  if (hasEphemeralTurn || hasStaticTurn) {
+    const current = userId ? activeUsers.get(userId) : null;
+    const suppliedToken = String(req.headers['x-session-token'] || '');
+    if (!current || !secureTokenEquals(suppliedToken, current.sessionToken)) {
+      res.status(401).json({ error: 'RTC_SESSION_REQUIRED' });
+      return;
+    }
+  }
+
+  if (hasEphemeralTurn) {
+    expiresAt = Math.floor(Date.now() / 1000) + TURN_TTL_SECONDS;
     const username = `${expiresAt}:${userId}`;
     const credential = crypto
       .createHmac('sha1', TURN_SECRET)
@@ -303,7 +683,7 @@ app.get('/api/rtc-config', (req, res) => {
       credential
     });
     turnMode = 'ephemeral';
-  } else if (TURN_URLS.length && TURN_USERNAME && TURN_CREDENTIAL) {
+  } else if (hasStaticTurn) {
     iceServers.push({
       urls: TURN_URLS,
       username: TURN_USERNAME,
@@ -318,7 +698,9 @@ app.get('/api/rtc-config', (req, res) => {
     iceTransportPolicy: 'all',
     turnConfigured: turnMode !== 'none',
     turnMode,
-    expiresInSeconds: turnMode === 'ephemeral' ? TURN_TTL_SECONDS : null
+    expiresAt,
+    expiresInSeconds: turnMode === 'ephemeral' ? TURN_TTL_SECONDS : null,
+    hasTurnTls: TURN_URLS.some((url) => /^turns:/i.test(url))
   });
 });
 
@@ -390,6 +772,7 @@ app.get('/', (req, res) => {
     .stream-info { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: bold; color: #fff; }
     .badge-live { background: var(--discord-red); color: white; font-size: 10px; font-weight: 800; padding: 2px 6px; border-radius: 4px; display: none; }
     .badge-gpu { background: #232428; border: 1px solid var(--discord-green); color: var(--discord-green); font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 4px; }
+    .badge-audience { background: #232428; border: 1px solid #5f6df5; color: #c7ccff; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 4px; display: none; }
 
     /* VÍDEO */
     .video-viewport { flex: 1; background: #000; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
@@ -408,6 +791,12 @@ app.get('/', (req, res) => {
     .btn-dock.copy { background: var(--discord-green); }
 
     #unmuteNotice { position: absolute; top: 20px; background: rgba(0,0,0,0.85); border: 1px solid #f0b232; color: #f0b232; padding: 8px 18px; border-radius: 20px; font-weight: bold; font-size: 12px; cursor: pointer; display: none; z-index: 100; }
+
+    .audience-panel { position: absolute; top: 18px; right: 18px; width: min(290px, calc(100% - 36px)); max-height: 42%; overflow-y: auto; background: rgba(20,20,22,0.90); border: 1px solid rgba(255,255,255,0.12); border-radius: 12px; padding: 10px 12px; backdrop-filter: blur(12px); z-index: 45; display: none; }
+    .audience-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #fff; font-size: 12px; font-weight: 800; }
+    .audience-subtitle { color: var(--text-muted); font-size: 10px; margin-top: 2px; }
+    .audience-list { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+    .audience-chip { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: #313338; color: var(--text-normal); border-radius: 999px; padding: 4px 8px; font-size: 10px; }
 
     /* POP-UP DISCORD DE PEDIDO DE AMIZADE */
     .discord-modal { position: fixed; top: 20px; right: 20px; background: #2b2d31; border: 2px solid var(--discord-blurple); border-radius: 8px; padding: 18px; box-shadow: 0 10px 30px rgba(0,0,0,0.8); display: none; flex-direction: column; gap: 12px; z-index: 999999; width: 320px; animation: slideIn 0.3s ease; }
@@ -464,6 +853,7 @@ app.get('/', (req, res) => {
         <span id="stageTitle">Nenhuma transmissão em andamento</span>
         <span class="badge-live" id="liveBadge">AO VIVO</span>
         <span class="badge-gpu" id="statusBadge">⚡ Full HD • 60 FPS • Auto</span>
+        <span class="badge-audience" id="audienceBadge">👁 0/0</span>
       </div>
       <span style="font-size: 12px; color: var(--discord-green);" id="connStatusText">🟢 Conectado à Nuvem</span>
     </div>
@@ -471,6 +861,15 @@ app.get('/', (req, res) => {
     <div class="video-viewport">
       <div id="unmuteNotice" onclick="unmute()">🔊 Clique aqui para ativar o áudio</div>
       <video id="remoteVideo" autoplay playsinline></video>
+
+      <div class="audience-panel" id="audiencePanel">
+        <div class="audience-title">
+          <span>👁 Observadores</span>
+          <span id="audienceCountText">0</span>
+        </div>
+        <div class="audience-subtitle" id="audienceRoleText">Ninguém assistindo ainda.</div>
+        <div class="audience-list" id="audienceList"></div>
+      </div>
       
       <div class="empty-state" id="emptyState">
         <svg viewBox="0 0 24 24"><path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 1.99-.9 1.99-2L23 5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z"/></svg>
@@ -492,6 +891,9 @@ app.get('/', (req, res) => {
     // --- CONFIGURAÇÃO DA PÁGINA / QUALIDADE ---
     const PAGE_APP_VERSION = ${JSON.stringify(APP_VERSION)};
     const ROOM_NAME = 'sala-principal';
+    const MAX_VIEWERS = ${MAX_VIEWERS_PER_STREAM};
+    const STREAM_UPLOAD_BUDGET = ${STREAM_UPLOAD_BUDGET_BPS};
+    const FORCE_TURN_RELAY_POLICY = ${FORCE_TURN_RELAY};
     const QUALITY = Object.freeze({
       width: 1920,
       height: 1080,
@@ -536,10 +938,18 @@ app.get('/', (req, res) => {
     const unmuteNotice = document.getElementById('unmuteNotice');
     const statusBadge = document.getElementById('statusBadge');
     const connStatusText = document.getElementById('connStatusText');
+    const audienceBadge = document.getElementById('audienceBadge');
+    const audiencePanel = document.getElementById('audiencePanel');
+    const audienceCountText = document.getElementById('audienceCountText');
+    const audienceRoleText = document.getElementById('audienceRoleText');
+    const audienceList = document.getElementById('audienceList');
 
     // --- ESTADO DE TRANSMISSÃO ---
     let localStream = null;
     let isSharing = false;
+    let currentAudience = [];
+    let currentAudienceMax = MAX_VIEWERS;
+    let currentAudienceBroadcasterId = null;
 
     // broadcaster: viewerId -> peer state
     const senderPeers = new Map();
@@ -556,6 +966,7 @@ app.get('/', (req, res) => {
     let viewerRecoveryTimer = null;
     let viewerRecoveryAttempts = 0;
     let desiredWatchId = null;
+    let wsSessionToken = null;
 
     // --- ICE / STUN / TURN DINÂMICO ---
     let rtcConfig = {
@@ -567,16 +978,33 @@ app.get('/', (req, res) => {
       iceTransportPolicy: 'all',
       bundlePolicy: 'max-bundle',
       rtcpMuxPolicy: 'require',
-      iceCandidatePoolSize: 6
+      iceCandidatePoolSize: 8
     };
     let turnConfigured = false;
+    let turnTlsConfigured = false;
     let rtcConfigLoadedAt = 0;
+    let rtcConfigExpiresAt = 0;
     let rtcConfigPromise = null;
 
+    function buildPeerRtcConfig(forceRelay) {
+      return {
+        iceServers: rtcConfig.iceServers,
+        iceTransportPolicy: forceRelay && turnConfigured ? 'relay' : 'all',
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require',
+        iceCandidatePoolSize: forceRelay ? 2 : 8
+      };
+    }
+
     async function refreshRtcConfig(force) {
-      const age = Date.now() - rtcConfigLoadedAt;
-      if (!force && rtcConfigLoadedAt && age < 12 * 60 * 60 * 1000) return rtcConfig;
+      const now = Date.now();
+      const age = now - rtcConfigLoadedAt;
+      const credentialsStillFresh = !rtcConfigExpiresAt || now < rtcConfigExpiresAt - 5 * 60 * 1000;
+      if (!force && rtcConfigLoadedAt && age < 30 * 60 * 1000 && credentialsStillFresh) return rtcConfig;
       if (rtcConfigPromise) return rtcConfigPromise;
+
+      // As credenciais TURN só são liberadas para uma sessão WebSocket autenticada.
+      if (!wsSessionToken) return rtcConfig;
 
       rtcConfigPromise = (async () => {
         try {
@@ -584,7 +1012,10 @@ app.get('/', (req, res) => {
           const timeout = setTimeout(() => controller.abort(), 5000);
           const res = await fetch('/api/rtc-config?userId=' + encodeURIComponent(myId), {
             cache: 'no-store',
-            signal: controller.signal
+            signal: controller.signal,
+            headers: {
+              'X-Session-Token': wsSessionToken
+            }
           });
           clearTimeout(timeout);
 
@@ -594,21 +1025,23 @@ app.get('/', (req, res) => {
           if (Array.isArray(data.iceServers) && data.iceServers.length) {
             rtcConfig = {
               iceServers: data.iceServers,
-              iceTransportPolicy: data.iceTransportPolicy || 'all',
+              iceTransportPolicy: 'all',
               bundlePolicy: 'max-bundle',
               rtcpMuxPolicy: 'require',
-              iceCandidatePoolSize: 6
+              iceCandidatePoolSize: 8
             };
           }
 
           turnConfigured = Boolean(data.turnConfigured);
+          turnTlsConfigured = Boolean(data.hasTurnTls);
           rtcConfigLoadedAt = Date.now();
+          rtcConfigExpiresAt = Number(data.expiresAt || 0) * 1000;
 
           if (!turnConfigured) {
             console.warn('TURN não configurado: P2P/STUN funcionará, mas alguns CGNATs/firewalls podem bloquear a conexão.');
           }
         } catch (err) {
-          console.warn('Falha ao carregar RTC config; usando STUN padrão:', err.message);
+          console.warn('Falha ao carregar RTC config; usando configuração ICE já disponível:', err.message);
         } finally {
           rtcConfigPromise = null;
         }
@@ -618,7 +1051,70 @@ app.get('/', (req, res) => {
       return rtcConfigPromise;
     }
 
-    refreshRtcConfig(false);
+    function renderAudience() {
+      const active = isSharing || Boolean(activeBroadcasterId || desiredWatchId);
+      if (!active) {
+        audienceBadge.style.display = 'none';
+        audiencePanel.style.display = 'none';
+        return;
+      }
+
+      const count = currentAudience.length;
+      audienceBadge.style.display = 'inline-block';
+      audienceBadge.textContent = '👁 ' + count + '/' + currentAudienceMax;
+      audiencePanel.style.display = 'block';
+      audienceCountText.textContent = count + '/' + currentAudienceMax;
+
+      if (isSharing) {
+        audienceRoleText.textContent = count === 0
+          ? 'Aguardando observadores...'
+          : count + ' pessoa(s) assistindo sua transmissão.';
+      } else {
+        audienceRoleText.textContent = count <= 1
+          ? 'Você está assistindo esta transmissão.'
+          : 'Você e mais ' + Math.max(0, count - 1) + ' pessoa(s) estão assistindo.';
+      }
+
+      audienceList.replaceChildren();
+      if (count === 0) {
+        const chip = document.createElement('span');
+        chip.className = 'audience-chip';
+        chip.textContent = 'Nenhum observador';
+        audienceList.appendChild(chip);
+        return;
+      }
+
+      currentAudience.forEach((viewer) => {
+        const chip = document.createElement('span');
+        chip.className = 'audience-chip';
+        const nick = String(viewer.nick || viewer.userId || 'Observador');
+        chip.textContent = viewer.userId === myId ? nick + ' (você)' : nick;
+        audienceList.appendChild(chip);
+      });
+    }
+
+    function applyAudienceSnapshot(data) {
+      if (!data || !data.broadcasterId) return;
+      const broadcasterId = String(data.broadcasterId).toLowerCase();
+      const relevant = isSharing
+        ? broadcasterId === myId
+        : broadcasterId === activeBroadcasterId || broadcasterId === desiredWatchId;
+      if (!relevant) return;
+
+      currentAudienceBroadcasterId = broadcasterId;
+      currentAudience = Array.isArray(data.viewers) ? data.viewers : [];
+      currentAudienceMax = Number(data.maxViewers || MAX_VIEWERS);
+      renderAudience();
+
+      if (isSharing) rebalanceSenderBitrates().catch(() => {});
+    }
+
+    function clearAudienceUi() {
+      currentAudience = [];
+      currentAudienceBroadcasterId = null;
+      currentAudienceMax = MAX_VIEWERS;
+      renderAudience();
+    }
 
     function createSessionId() {
       if (window.crypto && typeof window.crypto.randomUUID === 'function') {
@@ -757,6 +1253,11 @@ app.get('/', (req, res) => {
         }
 
         if (data.type === 'JOIN_OK') {
+          wsSessionToken = String(data.sessionToken || '');
+          rtcConfigLoadedAt = 0;
+          rtcConfigExpiresAt = 0;
+          await refreshRtcConfig(true);
+
           if (isSharing) {
             wsSend({ type: 'LIVE_STATE_CHANGE', isLive: true });
           }
@@ -768,7 +1269,7 @@ app.get('/', (req, res) => {
           if (desiredWatchId && desiredWatchId !== myId && !isSharing && viewerNeedsResync) {
             setTimeout(() => {
               if (ws === socket && socket.readyState === WebSocket.OPEN) {
-                requestWatch(desiredWatchId, true);
+                requestWatch(desiredWatchId, true, false);
               }
             }, 250);
           }
@@ -826,9 +1327,46 @@ app.get('/', (req, res) => {
           return;
         }
 
+        if (data.type === 'STREAM_AUDIENCE') {
+          applyAudienceSnapshot(data);
+          return;
+        }
+
+        if (data.type === 'STREAM_FULL') {
+          if (desiredWatchId === String(data.targetId || '').toLowerCase()) {
+            statusBadge.innerText = '⚠️ Live cheia • limite de ' + Number(data.maxViewers || MAX_VIEWERS) + ' espectadores';
+            desiredWatchId = null;
+            closeViewerConnection(false);
+            clearAudienceUi();
+          }
+          return;
+        }
+
+        if (data.type === 'STREAM_ENDED') {
+          const broadcasterId = String(data.broadcasterId || '').toLowerCase();
+          if (broadcasterId && (activeBroadcasterId === broadcasterId || desiredWatchId === broadcasterId)) {
+            desiredWatchId = null;
+            closeViewerConnection(false);
+            videoEl.srcObject = null;
+            emptyState.style.display = 'block';
+            stageTitle.innerText = 'Transmissão encerrada';
+            liveBadge.style.display = 'none';
+            btnDisconnect.style.display = 'none';
+            unmuteNotice.style.display = 'none';
+            statusBadge.innerText = '⚡ Full HD • 60 FPS • Auto';
+            clearAudienceUi();
+          }
+          return;
+        }
+
         if (data.type === 'STREAM_NOT_FOUND') {
           if (desiredWatchId === String(data.targetId || '').toLowerCase()) {
-            statusBadge.innerText = '⚠️ Transmissor offline';
+            if (viewerRecoveryAttempts > 0 && viewerRecoveryAttempts < 5) {
+              statusBadge.innerText = '🟡 Aguardando o transmissor reconectar...';
+              scheduleViewerRecovery(1000);
+            } else {
+              statusBadge.innerText = '⚠️ Transmissor offline';
+            }
           }
           return;
         }
@@ -839,7 +1377,7 @@ app.get('/', (req, res) => {
         }
 
         if (data.type === 'REQUEST_STREAM' && isSharing && localStream) {
-          await initiateStreamToViewer(data.from);
+          await initiateStreamToViewer(data.from, Boolean(data.forceRelay));
           return;
         }
 
@@ -865,6 +1403,7 @@ app.get('/', (req, res) => {
       socket.onclose = () => {
         if (ws !== socket) return;
         ws = null;
+        wsSessionToken = null;
         setConnectionUi('offline');
 
         if (allowReconnect) scheduleReconnect();
@@ -959,6 +1498,30 @@ app.get('/', (req, res) => {
       }
     }
 
+    function perViewerBitrateBudget() {
+      const connectedOrRequested = Math.max(1, senderPeers.size, currentAudience.length);
+      return Math.max(
+        QUALITY.minBitrate,
+        Math.min(QUALITY.maxBitrate, Math.floor(STREAM_UPLOAD_BUDGET / connectedOrRequested))
+      );
+    }
+
+    async function rebalanceSenderBitrates() {
+      if (!isSharing || senderPeers.size === 0) return;
+      const budgetCap = perViewerBitrateBudget();
+      const tasks = [];
+
+      senderPeers.forEach((peer) => {
+        if (!peer || peer.closed) return;
+        peer.budgetCap = budgetCap;
+        // Ao entrar/sair espectadores, sobe ou desce rapidamente para o novo teto seguro.
+        peer.targetBitrate = budgetCap;
+        tasks.push(applyVideoSenderProfile(peer.videoSender, peer.targetBitrate));
+      });
+
+      await Promise.allSettled(tasks);
+    }
+
     async function configureCaptureTrack(videoTrack) {
       if (!videoTrack) return;
 
@@ -985,6 +1548,10 @@ app.get('/', (req, res) => {
       }
 
       try {
+        if (activeBroadcasterId || desiredWatchId) {
+          desiredWatchId = null;
+          closeViewerConnection(true);
+        }
         await refreshRtcConfig(false);
 
         localStream = await navigator.mediaDevices.getDisplayMedia({
@@ -1006,6 +1573,10 @@ app.get('/', (req, res) => {
         }
 
         isSharing = true;
+        currentAudience = [];
+        currentAudienceBroadcasterId = myId;
+        currentAudienceMax = MAX_VIEWERS;
+        renderAudience();
         btnShare.innerText = 'Parar Transmissão';
         btnShare.classList.add('danger');
         btnCopyLink.style.display = 'inline-flex';
@@ -1057,17 +1628,19 @@ app.get('/', (req, res) => {
       videoEl.srcObject = null;
       emptyState.style.display = 'block';
       statusBadge.innerText = '⚡ Full HD • 60 FPS • Auto';
+      clearAudienceUi();
 
       wsSend({ type: 'LIVE_STATE_CHANGE', isLive: false });
     }
 
-    async function initiateStreamToViewer(viewerId) {
+    async function initiateStreamToViewer(viewerId, forceRelay = false, recoveryAttempts = 0) {
       if (!isSharing || !localStream || !viewerId) return;
 
       await refreshRtcConfig(false);
       closeSenderPeer(viewerId);
 
-      const pc = new RTCPeerConnection(rtcConfig);
+      forceRelay = Boolean((forceRelay || FORCE_TURN_RELAY_POLICY) && turnConfigured);
+      const pc = new RTCPeerConnection(buildPeerRtcConfig(forceRelay));
       const sessionId = createSessionId();
 
       const peer = {
@@ -1080,11 +1653,15 @@ app.get('/', (req, res) => {
         videoSender: null,
         statsTimer: null,
         reconnectTimer: null,
-        targetBitrate: QUALITY.maxBitrate,
+        forceRelay,
+        recoveryAttempts,
+        budgetCap: perViewerBitrateBudget(),
+        targetBitrate: perViewerBitrateBudget(),
         weakSamples: 0,
         strongSamples: 0,
         lastBytesSent: null,
         lastStatsAt: null,
+        currentMbps: null,
         closed: false
       };
 
@@ -1099,7 +1676,7 @@ app.get('/', (req, res) => {
             direction: 'sendonly',
             streams: [localStream],
             sendEncodings: [{
-              maxBitrate: QUALITY.maxBitrate,
+              maxBitrate: peer.targetBitrate,
               maxFramerate: QUALITY.fps,
               scaleResolutionDownBy: 1
             }]
@@ -1133,6 +1710,7 @@ app.get('/', (req, res) => {
         const state = pc.connectionState;
 
         if (state === 'connected') {
+          peer.recoveryAttempts = 0;
           if (peer.reconnectTimer) {
             clearTimeout(peer.reconnectTimer);
             peer.reconnectTimer = null;
@@ -1144,7 +1722,8 @@ app.get('/', (req, res) => {
         }
       };
 
-      await applyVideoSenderProfile(peer.videoSender, QUALITY.maxBitrate);
+      await rebalanceSenderBitrates();
+      await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate);
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -1160,8 +1739,9 @@ app.get('/', (req, res) => {
           width: QUALITY.width,
           height: QUALITY.height,
           fps: QUALITY.fps,
-          maxBitrate: QUALITY.maxBitrate
-        }
+          maxBitrate: peer.targetBitrate
+        },
+        forceRelay: peer.forceRelay
       });
 
       peer.signalReady = true;
@@ -1176,7 +1756,9 @@ app.get('/', (req, res) => {
       peer.reconnectTimer = setTimeout(() => {
         peer.reconnectTimer = null;
         if (peer.closed || senderPeers.get(viewerId) !== peer || !isSharing) return;
-        initiateStreamToViewer(viewerId).catch(console.warn);
+        const nextAttempts = Number(peer.recoveryAttempts || 0) + 1;
+        const useRelay = peer.forceRelay || (turnConfigured && nextAttempts >= 2);
+        initiateStreamToViewer(viewerId, useRelay, nextAttempts).catch(console.warn);
       }, delay);
     }
 
@@ -1217,6 +1799,7 @@ app.get('/', (req, res) => {
       } catch (_) {}
 
       senderPeers.delete(viewerId);
+      rebalanceSenderBitrates().catch(() => {});
 
       if (isSharing && senderPeers.size === 0 && localStream) {
         const track = localStream.getVideoTracks()[0];
@@ -1256,6 +1839,9 @@ app.get('/', (req, res) => {
           peer.lastBytesSent = outbound.bytesSent;
           peer.lastStatsAt = now;
 
+          peer.currentMbps = currentMbps;
+          peer.budgetCap = perViewerBitrateBudget();
+
           const available = Number(pair && pair.availableOutgoingBitrate || 0);
           if (available > 0) {
             if (available < peer.targetBitrate * 0.65) {
@@ -1272,13 +1858,13 @@ app.get('/', (req, res) => {
             if (peer.weakSamples >= 3) {
               peer.targetBitrate = Math.max(
                 QUALITY.minBitrate,
-                Math.min(QUALITY.maxBitrate, Math.floor(available * 0.90))
+                Math.min(peer.budgetCap, Math.floor(available * 0.90))
               );
               peer.weakSamples = 0;
               await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate);
-            } else if (peer.strongSamples >= 3 && peer.targetBitrate < QUALITY.maxBitrate) {
+            } else if (peer.strongSamples >= 3 && peer.targetBitrate < peer.budgetCap) {
               peer.targetBitrate = Math.min(
-                QUALITY.maxBitrate,
+                peer.budgetCap,
                 Math.max(peer.targetBitrate + 2_000_000, Math.floor(available * 0.80))
               );
               peer.strongSamples = 0;
@@ -1290,11 +1876,22 @@ app.get('/', (req, res) => {
             const fps = Math.round(outbound.framesPerSecond || QUALITY.fps);
             const width = outbound.frameWidth || QUALITY.width;
             const height = outbound.frameHeight || QUALITY.height;
-            const mbpsText = currentMbps === null ? 'iniciando' : currentMbps.toFixed(1) + ' Mbps';
+            let totalMbps = 0;
+            let measuredPeers = 0;
+            let relayPeers = 0;
+            senderPeers.forEach((p) => {
+              if (Number.isFinite(p.currentMbps)) {
+                totalMbps += p.currentMbps;
+                measuredPeers += 1;
+              }
+              if (p.forceRelay) relayPeers += 1;
+            });
+            const mbpsText = measuredPeers === 0 ? 'iniciando' : totalMbps.toFixed(1) + ' Mbps upload';
+            const routeText = relayPeers > 0 ? ' • ' + relayPeers + ' via TURN' : '';
 
             statusBadge.innerText =
               '⚡ ' + width + '×' + height + ' • ' + fps + ' FPS • ' +
-              mbpsText + ' • ' + senderPeers.size + ' espectador(es)';
+              mbpsText + ' • ' + senderPeers.size + ' espectador(es)' + routeText;
           }
         } catch (_) {}
       }, QUALITY.statsIntervalMs);
@@ -1315,8 +1912,11 @@ app.get('/', (req, res) => {
       viewerLocalCandidates = [];
       viewerSignalReady = false;
 
-      const pc = new RTCPeerConnection(rtcConfig);
+      const useRelayOnly = Boolean((data.forceRelay || FORCE_TURN_RELAY_POLICY) && turnConfigured);
+      const pc = new RTCPeerConnection(buildPeerRtcConfig(useRelayOnly));
       activePC = pc;
+      currentAudienceBroadcasterId = data.from;
+      renderAudience();
 
       const remoteMediaStream = new MediaStream();
       videoEl.srcObject = remoteMediaStream;
@@ -1451,8 +2051,9 @@ app.get('/', (req, res) => {
       viewerRecoveryTimer = setTimeout(() => {
         viewerRecoveryTimer = null;
         const target = desiredWatchId;
+        const useRelay = Boolean(turnConfigured && viewerRecoveryAttempts >= 2);
         closeViewerConnection(false);
-        if (target) requestWatch(target, true);
+        if (target) requestWatch(target, true, useRelay);
       }, backoff);
     }
 
@@ -1547,6 +2148,7 @@ app.get('/', (req, res) => {
 
     function disconnectStream() {
       desiredWatchId = null;
+      viewerRecoveryAttempts = 0;
       closeViewerConnection(true);
 
       videoEl.srcObject = null;
@@ -1556,6 +2158,7 @@ app.get('/', (req, res) => {
       btnDisconnect.style.display = 'none';
       unmuteNotice.style.display = 'none';
       statusBadge.innerText = '⚡ Full HD • 60 FPS • Auto';
+      clearAudienceUi();
     }
 
     // --- COPIAR LINK DA LIVE ---
@@ -1698,11 +2301,12 @@ app.get('/', (req, res) => {
       });
     }
 
-    function requestWatch(friendId, fromReconnect) {
+    function requestWatch(friendId, fromReconnect = false, forceRelay = false) {
       friendId = String(friendId || '').trim().toLowerCase();
       if (!friendId || friendId === myId || isSharing) return;
 
       if (!fromReconnect) {
+        viewerRecoveryAttempts = 0;
         addFriendToLocal(friendId, 'Amigo#' + friendId.slice(-4));
       }
 
@@ -1711,9 +2315,16 @@ app.get('/', (req, res) => {
       }
 
       desiredWatchId = friendId;
-      statusBadge.innerText = '🔄 Solicitando transmissão...';
+      currentAudienceBroadcasterId = friendId;
+      if (!fromReconnect) currentAudience = [];
+      renderAudience();
 
-      if (!wsSend({ type: 'REQUEST_STREAM', target: friendId })) {
+      const relayRequested = Boolean((forceRelay || FORCE_TURN_RELAY_POLICY) && turnConfigured);
+      statusBadge.innerText = relayRequested
+        ? '🔄 Reconectando pela rota TURN segura...'
+        : '🔄 Solicitando transmissão...';
+
+      if (!wsSend({ type: 'REQUEST_STREAM', target: friendId, forceRelay: relayRequested })) {
         scheduleReconnect();
       }
     }
@@ -1747,8 +2358,9 @@ app.get('/', (req, res) => {
     if (initialWatchId && initialWatchId !== myId) desiredWatchId = initialWatchId;
 
     window.addEventListener('beforeunload', () => {
-      if (activeBroadcasterId) {
-        wsSend({ type: 'STOP_WATCH', target: activeBroadcasterId });
+      const target = activeBroadcasterId || desiredWatchId;
+      if (target) {
+        wsSend({ type: 'STOP_WATCH', target });
       }
     });
 
