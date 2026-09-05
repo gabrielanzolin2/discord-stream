@@ -1,142 +1,330 @@
 const express = require('express');
 const http = require('http');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({
+  server,
+  maxPayload: 512 * 1024,
+  perMessageDeflate: false
+});
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
+const APP_VERSION = process.env.APP_VERSION || (process.env.RENDER_GIT_COMMIT ? process.env.RENDER_GIT_COMMIT.slice(0, 12) : '2026.09.04-ultra-1');
+const DEFAULT_ROOM = 'sala-principal';
 
-// Gerenciamento de Usuários
-const activeUsers = new Map(); // [userId -> { ws, nick, isLive, room }]
-const rooms = new Map();
+const TURN_URLS = String(process.env.TURN_URLS || '')
+  .split(',')
+  .map(v => v.trim())
+  .filter(Boolean);
+const TURN_SECRET = String(process.env.TURN_SECRET || '').trim();
+const TURN_USERNAME = String(process.env.TURN_USERNAME || '').trim();
+const TURN_CREDENTIAL = String(process.env.TURN_CREDENTIAL || '').trim();
+const TURN_TTL_SECONDS = Math.max(300, Number(process.env.TURN_TTL_SECONDS || 86400));
+
+const STUN_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' }
+];
+
+app.disable('x-powered-by');
+
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(self), display-capture=(self), fullscreen=(self)');
+  next();
+});
+
+// Gerenciamento de usuários e salas
+const activeUsers = new Map(); // userId -> { ws, nick, isLive, room, joinedAt }
+const rooms = new Map();       // room -> Map(userId -> ws)
+
+function normalizeId(value) {
+  const id = String(value || '').trim().toLowerCase();
+  return /^[a-z0-9_-]{3,64}$/.test(id) ? id : null;
+}
+
+function normalizeRoom(value) {
+  const room = String(value || DEFAULT_ROOM).trim().toLowerCase();
+  return /^[a-z0-9_-]{1,64}$/.test(room) ? room : DEFAULT_ROOM;
+}
+
+function normalizeNick(value) {
+  const nick = String(value || 'Gamer').trim().replace(/[\u0000-\u001F\u007F]/g, '');
+  return (nick || 'Gamer').slice(0, 48);
+}
+
+function safeSend(ws, payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  if (ws.bufferedAmount > 2 * 1024 * 1024) return false;
+  ws.send(JSON.stringify(payload));
+  return true;
+}
+
+function getRoomClients(room) {
+  if (!rooms.has(room)) rooms.set(room, new Map());
+  return rooms.get(room);
+}
+
+function broadcastToRoom(room, senderId, payload) {
+  const clients = rooms.get(room);
+  if (!clients) return;
+  for (const [id, clientWs] of clients) {
+    if (id !== senderId) safeSend(clientWs, payload);
+  }
+}
 
 wss.on('connection', (ws) => {
   let userId = null;
   let userNick = null;
-  let userRoom = 'sala-principal';
+  let userRoom = DEFAULT_ROOM;
+
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  safeSend(ws, {
+    type: 'SERVER_HELLO',
+    appVersion: APP_VERSION,
+    serverTime: Date.now()
+  });
 
   ws.on('message', (message) => {
     try {
-      const data = JSON.parse(message);
+      const data = JSON.parse(message.toString());
+      if (!data || typeof data.type !== 'string') return;
 
-      // Heartbeat para manter o Render ativo
       if (data.type === 'PING') {
-        ws.send(JSON.stringify({ type: 'PONG' }));
+        safeSend(ws, { type: 'PONG', t: data.t || Date.now(), serverTime: Date.now() });
         return;
       }
 
-      // 1. Entrada de Usuário
       if (data.type === 'JOIN') {
-        userId = String(data.userId).trim().toLowerCase();
-        userNick = data.nick || 'Gamer';
-        userRoom = data.room || 'sala-principal';
-
-        activeUsers.set(userId, { ws, nick: userNick, isLive: false, room: userRoom });
-
-        if (!rooms.has(userRoom)) rooms.set(userRoom, new Map());
-        rooms.get(userRoom).set(userId, ws);
-
-        broadcastToRoom(userRoom, userId, { type: 'USER_JOINED', userId, nick: userNick });
-
-        // Envia lista de quem já está ao vivo
-        const liveUsers = [];
-        for (const [id, u] of activeUsers) {
-          if (u.isLive && id !== userId) liveUsers.push({ userId: id, nick: u.nick });
+        const nextUserId = normalizeId(data.userId);
+        if (!nextUserId) {
+          safeSend(ws, { type: 'ERROR', code: 'INVALID_USER_ID' });
+          return;
         }
-        ws.send(JSON.stringify({ type: 'SYNC_LIVE_USERS', liveUsers }));
+
+        userId = nextUserId;
+        userNick = normalizeNick(data.nick);
+        userRoom = normalizeRoom(data.room);
+        const isLive = Boolean(data.isLive);
+
+        const previous = activeUsers.get(userId);
+        if (previous && previous.ws !== ws) {
+          safeSend(previous.ws, { type: 'SESSION_REPLACED' });
+          try { previous.ws.close(4001, 'Session replaced'); } catch (_) {}
+        }
+
+        activeUsers.set(userId, {
+          ws,
+          nick: userNick,
+          isLive,
+          room: userRoom,
+          joinedAt: Date.now()
+        });
+
+        getRoomClients(userRoom).set(userId, ws);
+
+        broadcastToRoom(userRoom, userId, {
+          type: 'USER_JOINED',
+          userId,
+          nick: userNick
+        });
+
+        const liveUsers = [];
+        for (const [id, user] of activeUsers) {
+          if (user.room === userRoom && user.isLive && id !== userId) {
+            liveUsers.push({ userId: id, nick: user.nick });
+          }
+        }
+
+        safeSend(ws, {
+          type: 'JOIN_OK',
+          userId,
+          nick: userNick,
+          room: userRoom,
+          appVersion: APP_VERSION
+        });
+        safeSend(ws, { type: 'SYNC_LIVE_USERS', liveUsers });
+        return;
       }
 
-      // 2. Pedido de Amizade
+      if (!userId || activeUsers.get(userId)?.ws !== ws) return;
+
       if (data.type === 'FRIEND_REQUEST') {
-        const targetId = String(data.targetId).trim().toLowerCase();
+        const targetId = normalizeId(data.targetId);
+        if (!targetId) return;
         const targetClient = activeUsers.get(targetId);
 
-        if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
-          targetClient.ws.send(JSON.stringify({
+        if (targetClient) {
+          safeSend(targetClient.ws, {
             type: 'FRIEND_REQUEST_INCOMING',
             fromId: userId,
             fromNick: userNick
-          }));
+          });
         } else {
-          ws.send(JSON.stringify({ type: 'FRIEND_NOT_FOUND', targetId }));
+          safeSend(ws, { type: 'FRIEND_NOT_FOUND', targetId });
         }
+        return;
       }
 
-      // 3. Resposta do Pedido de Amizade
       if (data.type === 'FRIEND_RESPONSE') {
-        const targetId = String(data.targetId).trim().toLowerCase();
+        const targetId = normalizeId(data.targetId);
+        if (!targetId) return;
         const targetClient = activeUsers.get(targetId);
-        if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
-          targetClient.ws.send(JSON.stringify({
+
+        if (targetClient) {
+          safeSend(targetClient.ws, {
             type: 'FRIEND_RESPONSE_RESULT',
             fromId: userId,
             fromNick: userNick,
-            accepted: data.accepted
-          }));
+            accepted: Boolean(data.accepted)
+          });
         }
+        return;
       }
 
-      // 4. Mudança de Estado (Ao Vivo)
       if (data.type === 'LIVE_STATE_CHANGE') {
-        if (activeUsers.has(userId)) {
-          activeUsers.get(userId).isLive = data.isLive;
-        }
-        broadcastToAll({
+        const current = activeUsers.get(userId);
+        if (current && current.ws === ws) current.isLive = Boolean(data.isLive);
+
+        broadcastToRoom(userRoom, userId, {
           type: 'USER_LIVE_STATE',
           userId,
           nick: userNick,
-          isLive: data.isLive
+          isLive: Boolean(data.isLive)
+        });
+        return;
+      }
+
+      if (['OFFER', 'ANSWER', 'CANDIDATE', 'REQUEST_STREAM', 'STOP_WATCH'].includes(data.type)) {
+        const targetId = normalizeId(data.target);
+        if (!targetId || targetId === userId) return;
+
+        const targetClient = activeUsers.get(targetId);
+        if (!targetClient) {
+          if (data.type === 'REQUEST_STREAM') {
+            safeSend(ws, { type: 'STREAM_NOT_FOUND', targetId });
+          }
+          return;
+        }
+
+        safeSend(targetClient.ws, {
+          ...data,
+          from: userId,
+          fromNick: userNick
         });
       }
-
-      // 5. Sinalização WebRTC
-      if (['OFFER', 'ANSWER', 'CANDIDATE', 'REQUEST_STREAM'].includes(data.type)) {
-        const target = String(data.target).trim().toLowerCase();
-        const targetClient = activeUsers.get(target);
-        if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
-          targetClient.ws.send(JSON.stringify({ ...data, from: userId, fromNick: userNick }));
-        }
-      }
-
     } catch (err) {
-      console.error('Erro WebSocket:', err);
+      console.error('Erro WebSocket:', err.message);
+      safeSend(ws, { type: 'ERROR', code: 'BAD_MESSAGE' });
     }
+  });
+
+  ws.on('error', (err) => {
+    console.warn('WebSocket error:', err.message);
   });
 
   ws.on('close', () => {
-    if (userId) {
-      activeUsers.delete(userId);
-      if (rooms.has(userRoom)) {
-        rooms.get(userRoom).delete(userId);
-        broadcastToRoom(userRoom, userId, { type: 'USER_LEFT', userId });
-      }
-      broadcastToAll({ type: 'USER_LIVE_STATE', userId, isLive: false });
+    if (!userId) return;
+
+    const current = activeUsers.get(userId);
+    if (!current || current.ws !== ws) return;
+
+    activeUsers.delete(userId);
+
+    const roomClients = rooms.get(userRoom);
+    if (roomClients?.get(userId) === ws) {
+      roomClients.delete(userId);
+      if (roomClients.size === 0) rooms.delete(userRoom);
     }
+
+    broadcastToRoom(userRoom, userId, { type: 'USER_LEFT', userId });
+    broadcastToRoom(userRoom, userId, {
+      type: 'USER_LIVE_STATE',
+      userId,
+      nick: userNick,
+      isLive: false
+    });
   });
 });
 
-function broadcastToRoom(room, senderId, data) {
-  const clients = rooms.get(room);
-  if (!clients) return;
-  for (const [id, clientWs] of clients) {
-    if (id !== senderId && clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(JSON.stringify(data));
+const wsHeartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch (_) {}
+      continue;
     }
+    ws.isAlive = false;
+    try { ws.ping(); } catch (_) {}
   }
-}
+}, 25000);
 
-function broadcastToAll(data) {
-  for (const [, client] of activeUsers) {
-    if (client.ws.readyState === WebSocket.OPEN) {
-      client.ws.send(JSON.stringify(data));
-    }
+wss.on('close', () => clearInterval(wsHeartbeat));
+
+app.get('/health', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    appVersion: APP_VERSION,
+    usersOnline: activeUsers.size,
+    uptimeSeconds: Math.floor(process.uptime())
+  });
+});
+
+app.get('/api/version', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ appVersion: APP_VERSION, serverTime: Date.now() });
+});
+
+app.get('/api/rtc-config', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+
+  const iceServers = [...STUN_SERVERS];
+  let turnMode = 'none';
+
+  if (TURN_URLS.length && TURN_SECRET) {
+    const userId = normalizeId(req.query.userId) || 'guest';
+    const expiresAt = Math.floor(Date.now() / 1000) + TURN_TTL_SECONDS;
+    const username = `${expiresAt}:${userId}`;
+    const credential = crypto
+      .createHmac('sha1', TURN_SECRET)
+      .update(username)
+      .digest('base64');
+
+    iceServers.push({
+      urls: TURN_URLS,
+      username,
+      credential
+    });
+    turnMode = 'ephemeral';
+  } else if (TURN_URLS.length && TURN_USERNAME && TURN_CREDENTIAL) {
+    iceServers.push({
+      urls: TURN_URLS,
+      username: TURN_USERNAME,
+      credential: TURN_CREDENTIAL
+    });
+    turnMode = 'static';
   }
-}
+
+  res.json({
+    appVersion: APP_VERSION,
+    iceServers,
+    iceTransportPolicy: 'all',
+    turnConfigured: turnMode !== 'none',
+    turnMode,
+    expiresInSeconds: turnMode === 'ephemeral' ? TURN_TTL_SECONDS : null
+  });
+});
 
 // FRONTEND COMPLETO DO DISCORD
 app.get('/', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
   res.send(`
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -275,7 +463,7 @@ app.get('/', (req, res) => {
       <div class="stream-info">
         <span id="stageTitle">Nenhuma transmissão em andamento</span>
         <span class="badge-live" id="liveBadge">AO VIVO</span>
-        <span class="badge-gpu" id="statusBadge">⚡ 60 FPS • Full HD</span>
+        <span class="badge-gpu" id="statusBadge">⚡ Full HD • 60 FPS • Auto</span>
       </div>
       <span style="font-size: 12px; color: var(--discord-green);" id="connStatusText">🟢 Conectado à Nuvem</span>
     </div>
@@ -301,6 +489,19 @@ app.get('/', (req, res) => {
   </div>
 
   <script>
+    // --- CONFIGURAÇÃO DA PÁGINA / QUALIDADE ---
+    const PAGE_APP_VERSION = ${JSON.stringify(APP_VERSION)};
+    const ROOM_NAME = 'sala-principal';
+    const QUALITY = Object.freeze({
+      width: 1920,
+      height: 1080,
+      fps: 60,
+      startTargetBitrate: 12_000_000,
+      maxBitrate: 18_000_000,
+      minBitrate: 3_000_000,
+      statsIntervalMs: 2500
+    });
+
     // --- IDENTIDADE LOCAL ---
     let myId = localStorage.getItem('dc_user_id');
     if (!myId) {
@@ -310,7 +511,14 @@ app.get('/', (req, res) => {
     myId = myId.trim().toLowerCase();
 
     let myNick = localStorage.getItem('dc_user_nick') || 'Gamer#' + myId.slice(-4);
-    let friends = JSON.parse(localStorage.getItem('dc_saved_friends') || '[]');
+    let friends = [];
+    try {
+      friends = JSON.parse(localStorage.getItem('dc_saved_friends') || '[]');
+      if (!Array.isArray(friends)) friends = [];
+    } catch (_) {
+      friends = [];
+    }
+
     let liveFriendIds = new Set();
     let pendingRequestFrom = null;
 
@@ -327,39 +535,97 @@ app.get('/', (req, res) => {
     const btnDisconnect = document.getElementById('btnDisconnect');
     const unmuteNotice = document.getElementById('unmuteNotice');
     const statusBadge = document.getElementById('statusBadge');
+    const connStatusText = document.getElementById('connStatusText');
 
+    // --- ESTADO DE TRANSMISSÃO ---
     let localStream = null;
     let isSharing = false;
 
-    // Conexão WebRTC (Assistindo)
+    // broadcaster: viewerId -> peer state
+    const senderPeers = new Map();
+
+    // viewer
     let activePC = null;
-    let activePCQueue = [];
+    let activeBroadcasterId = null;
+    let activeSessionId = null;
     let activePCRemoteReady = false;
+    let activePCQueue = [];
+    let viewerLocalCandidates = [];
+    let viewerSignalReady = false;
+    let viewerStatsTimer = null;
+    let viewerRecoveryTimer = null;
+    let viewerRecoveryAttempts = 0;
+    let desiredWatchId = null;
 
-    // Conexões WebRTC (Transmitindo para N amigos)
-    let senderPCs = new Map();
-    let senderQueues = new Map();
-    let senderRemoteReady = new Map();
-
-    // SERVIDORES STUN + TURN ATIVOS (FURA CGNAT BRASIL)
-    const rtcConfig = {
+    // --- ICE / STUN / TURN DINÂMICO ---
+    let rtcConfig = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun.cloudflare.com:3478' },
-        { urls: 'stun:freeturn.net:3478' },
-        {
-          urls: [
-            'turn:freeturn.net:3478?transport=udp',
-            'turn:freeturn.net:3478?transport=tcp'
-          ],
-          username: 'free',
-          credential: 'free'
-        }
+        { urls: 'stun:stun.cloudflare.com:3478' }
       ],
-      iceCandidatePoolSize: 10
+      iceTransportPolicy: 'all',
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+      iceCandidatePoolSize: 6
     };
+    let turnConfigured = false;
+    let rtcConfigLoadedAt = 0;
+    let rtcConfigPromise = null;
+
+    async function refreshRtcConfig(force) {
+      const age = Date.now() - rtcConfigLoadedAt;
+      if (!force && rtcConfigLoadedAt && age < 12 * 60 * 60 * 1000) return rtcConfig;
+      if (rtcConfigPromise) return rtcConfigPromise;
+
+      rtcConfigPromise = (async () => {
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 5000);
+          const res = await fetch('/api/rtc-config?userId=' + encodeURIComponent(myId), {
+            cache: 'no-store',
+            signal: controller.signal
+          });
+          clearTimeout(timeout);
+
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const data = await res.json();
+
+          if (Array.isArray(data.iceServers) && data.iceServers.length) {
+            rtcConfig = {
+              iceServers: data.iceServers,
+              iceTransportPolicy: data.iceTransportPolicy || 'all',
+              bundlePolicy: 'max-bundle',
+              rtcpMuxPolicy: 'require',
+              iceCandidatePoolSize: 6
+            };
+          }
+
+          turnConfigured = Boolean(data.turnConfigured);
+          rtcConfigLoadedAt = Date.now();
+
+          if (!turnConfigured) {
+            console.warn('TURN não configurado: P2P/STUN funcionará, mas alguns CGNATs/firewalls podem bloquear a conexão.');
+          }
+        } catch (err) {
+          console.warn('Falha ao carregar RTC config; usando STUN padrão:', err.message);
+        } finally {
+          rtcConfigPromise = null;
+        }
+        return rtcConfig;
+      })();
+
+      return rtcConfigPromise;
+    }
+
+    refreshRtcConfig(false);
+
+    function createSessionId() {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+      return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+    }
 
     function playDiscordChime() {
       try {
@@ -374,38 +640,158 @@ app.get('/', (req, res) => {
         gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.35);
         osc.start();
         osc.stop(ctx.currentTime + 0.35);
-      } catch (e) {}
+      } catch (_) {}
     }
 
-    // --- CONEXÃO WEBSOCKET COM AUTO-RECONNECT ---
+    // --- AUTO-UPDATE DA APLICAÇÃO ---
+    function updateToVersion(version) {
+      if (!version || version === PAGE_APP_VERSION) return;
+
+      const key = 'dc_reloaded_for_version';
+      if (sessionStorage.getItem(key) === version) {
+        console.warn('Servidor está em versão diferente, mas a página já tentou recarregar para esta versão:', version);
+        return;
+      }
+
+      sessionStorage.setItem(key, version);
+      location.reload();
+    }
+
+    async function checkAppVersion() {
+      try {
+        const res = await fetch('/api/version?ts=' + Date.now(), { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        updateToVersion(data.appVersion);
+      } catch (_) {}
+    }
+
+    setInterval(checkAppVersion, 60000);
+    window.addEventListener('focus', checkAppVersion);
+
+    // --- WEBSOCKET ROBUSTO COM BACKOFF + RESYNC ---
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     let ws = null;
+    let reconnectTimer = null;
+    let reconnectAttempt = 0;
+    let allowReconnect = true;
+
+    function setConnectionUi(state) {
+      if (state === 'online') {
+        connStatusText.innerText = '🟢 Conectado à Nuvem';
+        connStatusText.style.color = 'var(--discord-green)';
+      } else if (state === 'connecting') {
+        connStatusText.innerText = '🟡 Reconectando...';
+        connStatusText.style.color = '#f0b232';
+      } else {
+        connStatusText.innerText = '🔴 Sem conexão com a Nuvem';
+        connStatusText.style.color = 'var(--discord-red)';
+      }
+    }
+
+    function wsSend(payload) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      try {
+        ws.send(JSON.stringify(payload));
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function scheduleReconnect() {
+      if (!allowReconnect || reconnectTimer || !navigator.onLine) return;
+
+      const base = Math.min(10000, 500 * Math.pow(2, Math.min(reconnectAttempt, 5)));
+      const jitter = Math.floor(Math.random() * 350);
+      const delay = base + jitter;
+      reconnectAttempt += 1;
+
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectWS();
+      }, delay);
+    }
 
     function connectWS() {
-      ws = new WebSocket(protocol + '//' + location.host);
+      if (!allowReconnect) return;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
-      ws.onopen = () => {
-        ws.send(JSON.stringify({ type: 'JOIN', userId: myId, nick: myNick, room: 'sala-principal' }));
+      setConnectionUi('connecting');
+      const socket = new WebSocket(protocol + '//' + location.host);
+      ws = socket;
 
-        // Se entrou pelo link direto (?watch=dc-12345)
-        const params = new URLSearchParams(window.location.search);
-        const autoWatchId = params.get('watch');
-        if (autoWatchId && autoWatchId.trim().toLowerCase() !== myId) {
-          setTimeout(() => {
-            requestWatch(autoWatchId.trim().toLowerCase());
-          }, 600);
-        }
+      socket.onopen = () => {
+        if (ws !== socket) return;
+        reconnectAttempt = 0;
+        setConnectionUi('online');
+
+        wsSend({
+          type: 'JOIN',
+          userId: myId,
+          nick: myNick,
+          room: ROOM_NAME,
+          isLive: isSharing
+        });
       };
 
-      ws.onmessage = async (event) => {
-        const data = JSON.parse(event.data);
+      socket.onmessage = async (event) => {
+        if (ws !== socket) return;
 
-        // PEDIDO DE AMIZADE
+        let data;
+        try {
+          data = JSON.parse(event.data);
+        } catch (_) {
+          return;
+        }
+
+        if (data.type === 'SERVER_HELLO') {
+          updateToVersion(data.appVersion);
+          return;
+        }
+
+        if (data.type === 'SERVER_RESTARTING') {
+          setConnectionUi('connecting');
+          connStatusText.innerText = '🟡 Servidor atualizando...';
+          return;
+        }
+
+        if (data.type === 'JOIN_OK') {
+          if (isSharing) {
+            wsSend({ type: 'LIVE_STATE_CHANGE', isLive: true });
+          }
+
+          const viewerNeedsResync =
+            !activePC ||
+            ['failed', 'closed'].includes(activePC.connectionState);
+
+          if (desiredWatchId && desiredWatchId !== myId && !isSharing && viewerNeedsResync) {
+            setTimeout(() => {
+              if (ws === socket && socket.readyState === WebSocket.OPEN) {
+                requestWatch(desiredWatchId, true);
+              }
+            }, 250);
+          }
+          return;
+        }
+
+        if (data.type === 'SESSION_REPLACED') {
+          allowReconnect = false;
+          setConnectionUi('offline');
+          alert('Esta identidade foi aberta em outra aba ou dispositivo. Esta sessão foi desconectada para evitar conflito.');
+          try { socket.close(); } catch (_) {}
+          return;
+        }
+
+        if (data.type === 'PONG') return;
+
         if (data.type === 'FRIEND_REQUEST_INCOMING') {
           playDiscordChime();
           pendingRequestFrom = { id: data.fromId, nick: data.fromNick };
-          document.getElementById('friendRequestText').innerText = data.fromNick + ' (' + data.fromId + ') quer ser seu amigo!';
+          document.getElementById('friendRequestText').innerText =
+            data.fromNick + ' (' + data.fromId + ') quer ser seu amigo!';
           document.getElementById('friendRequestModal').style.display = 'flex';
+          return;
         }
 
         if (data.type === 'FRIEND_RESPONSE_RESULT') {
@@ -415,82 +801,183 @@ app.get('/', (req, res) => {
           } else {
             alert('❌ ' + data.fromNick + ' recusou o pedido.');
           }
+          return;
         }
 
         if (data.type === 'FRIEND_NOT_FOUND') {
           alert('❌ O ID ' + data.targetId + ' não está online no momento!');
+          return;
         }
 
-        // SINCRONIZAÇÃO DE STATUS AO VIVO
         if (data.type === 'SYNC_LIVE_USERS') {
-          data.liveUsers.forEach(u => liveFriendIds.add(u.userId.toLowerCase()));
+          liveFriendIds.clear();
+          (data.liveUsers || []).forEach((u) => {
+            if (u && u.userId) liveFriendIds.add(String(u.userId).toLowerCase());
+          });
           renderFriends();
+          return;
         }
 
         if (data.type === 'USER_LIVE_STATE') {
-          if (data.isLive) liveFriendIds.add(data.userId.toLowerCase());
-          else liveFriendIds.delete(data.userId.toLowerCase());
+          const id = String(data.userId || '').toLowerCase();
+          if (data.isLive) liveFriendIds.add(id);
+          else liveFriendIds.delete(id);
           renderFriends();
+          return;
         }
 
-        // SOLICITAÇÃO DE STREAM
+        if (data.type === 'STREAM_NOT_FOUND') {
+          if (desiredWatchId === String(data.targetId || '').toLowerCase()) {
+            statusBadge.innerText = '⚠️ Transmissor offline';
+          }
+          return;
+        }
+
+        if (data.type === 'STOP_WATCH') {
+          closeSenderPeer(data.from);
+          return;
+        }
+
         if (data.type === 'REQUEST_STREAM' && isSharing && localStream) {
-          initiateStreamToViewer(data.from);
+          await initiateStreamToViewer(data.from);
+          return;
         }
 
-        // SINALIZAÇÃO WEBRTC
         if (data.type === 'OFFER') {
-          handleIncomingOffer(data);
+          await handleIncomingOffer(data);
+          return;
         }
 
         if (data.type === 'ANSWER') {
-          const pc = senderPCs.get(data.from);
-          if (pc) {
-            await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-            senderRemoteReady.set(data.from, true);
-            const queue = senderQueues.get(data.from) || [];
-            while (queue.length > 0) {
-              const c = queue.shift();
-              await pc.addIceCandidate(c).catch(console.warn);
-            }
-          }
+          await handleSenderAnswer(data);
+          return;
         }
 
         if (data.type === 'CANDIDATE') {
-          if (activePC) {
-            if (!activePCRemoteReady) {
-              activePCQueue.push(data.candidate);
-            } else {
-              await activePC.addIceCandidate(data.candidate).catch(console.warn);
-            }
-          } else if (senderPCs.has(data.from)) {
-            const pc = senderPCs.get(data.from);
-            const ready = senderRemoteReady.get(data.from);
-            if (!ready) {
-              if (!senderQueues.has(data.from)) senderQueues.set(data.from, []);
-              senderQueues.get(data.from).push(data.candidate);
-            } else {
-              await pc.addIceCandidate(data.candidate).catch(console.warn);
-            }
-          }
+          await handleRemoteCandidate(data);
         }
       };
 
-      ws.onclose = () => {
-        setTimeout(connectWS, 2000);
+      socket.onerror = () => {
+        if (ws === socket) setConnectionUi('connecting');
+      };
+
+      socket.onclose = () => {
+        if (ws !== socket) return;
+        ws = null;
+        setConnectionUi('offline');
+
+        if (allowReconnect) scheduleReconnect();
       };
     }
 
     connectWS();
 
-    // Heartbeat regular
     setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'PING' }));
-      }
+      wsSend({ type: 'PING', t: Date.now() });
     }, 15000);
 
-    // --- TRANSMISSÃO NATIVA SEM TELA PRETA ---
+    window.addEventListener('online', () => {
+      allowReconnect = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      connectWS();
+    });
+
+    window.addEventListener('offline', () => {
+      setConnectionUi('offline');
+    });
+
+    // --- WEBRTC: CODECS E PERFIL DE ALTA QUALIDADE ---
+    function preferScreenShareCodecs(transceiver) {
+      if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
+      if (!window.RTCRtpSender || typeof RTCRtpSender.getCapabilities !== 'function') return;
+
+      try {
+        const caps = RTCRtpSender.getCapabilities('video');
+        if (!caps || !Array.isArray(caps.codecs)) return;
+
+        const rank = {
+          'video/VP9': 0,
+          'video/H264': 1,
+          'video/VP8': 2,
+          'video/AV1': 3
+        };
+
+        const primary = [];
+        const auxiliary = [];
+
+        caps.codecs.forEach((codec) => {
+          if (Object.prototype.hasOwnProperty.call(rank, codec.mimeType)) primary.push(codec);
+          else auxiliary.push(codec);
+        });
+
+        primary.sort((a, b) => rank[a.mimeType] - rank[b.mimeType]);
+        transceiver.setCodecPreferences(primary.concat(auxiliary));
+      } catch (err) {
+        console.warn('Não foi possível ajustar preferência de codec:', err.message);
+      }
+    }
+
+    async function applyVideoSenderProfile(sender, targetBitrate) {
+      if (!sender || !sender.track || sender.track.kind !== 'video') return;
+
+      const bitrate = Math.max(
+        QUALITY.minBitrate,
+        Math.min(QUALITY.maxBitrate, Number(targetBitrate || QUALITY.maxBitrate))
+      );
+
+      try {
+        const params = sender.getParameters();
+        if (!Array.isArray(params.encodings) || params.encodings.length === 0) {
+          params.encodings = [{}];
+        }
+
+        params.encodings[0].maxBitrate = bitrate;
+        params.encodings[0].maxFramerate = QUALITY.fps;
+        params.encodings[0].scaleResolutionDownBy = 1;
+        params.degradationPreference = 'maintain-resolution';
+
+        await sender.setParameters(params);
+        return;
+      } catch (err) {
+        console.warn('Perfil RTP completo não suportado; tentando modo compatível:', err.message);
+      }
+
+      try {
+        const fallback = sender.getParameters();
+        if (!Array.isArray(fallback.encodings) || fallback.encodings.length === 0) {
+          fallback.encodings = [{}];
+        }
+        fallback.encodings[0].maxBitrate = bitrate;
+        fallback.encodings[0].maxFramerate = QUALITY.fps;
+        await sender.setParameters(fallback);
+      } catch (err) {
+        console.warn('Ajuste RTP de bitrate/FPS não suportado por este navegador:', err.message);
+      }
+    }
+
+    async function configureCaptureTrack(videoTrack) {
+      if (!videoTrack) return;
+
+      if ('contentHint' in videoTrack) {
+        videoTrack.contentHint = 'motion';
+      }
+
+      try {
+        await videoTrack.applyConstraints({
+          width: { ideal: QUALITY.width, max: QUALITY.width },
+          height: { ideal: QUALITY.height, max: QUALITY.height },
+          frameRate: { ideal: QUALITY.fps, max: QUALITY.fps }
+        });
+      } catch (err) {
+        console.warn('O navegador manteve as restrições nativas da captura:', err.message);
+      }
+    }
+
+    // --- TRANSMISSÃO ---
     async function toggleShare() {
       if (isSharing) {
         stopShare();
@@ -498,50 +985,68 @@ app.get('/', (req, res) => {
       }
 
       try {
+        await refreshRtcConfig(false);
+
         localStream = await navigator.mediaDevices.getDisplayMedia({
           video: {
-            frameRate: { ideal: 60, max: 60 },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 }
+            frameRate: { ideal: QUALITY.fps, max: QUALITY.fps },
+            width: { ideal: QUALITY.width, max: QUALITY.width },
+            height: { ideal: QUALITY.height, max: QUALITY.height }
           },
           audio: true
         });
 
         const videoTrack = localStream.getVideoTracks()[0];
-        if (videoTrack && 'contentHint' in videoTrack) {
-          videoTrack.contentHint = 'motion';
+        const audioTrack = localStream.getAudioTracks()[0];
+
+        await configureCaptureTrack(videoTrack);
+
+        if (audioTrack && 'contentHint' in audioTrack) {
+          audioTrack.contentHint = 'music';
         }
 
         isSharing = true;
         btnShare.innerText = 'Parar Transmissão';
         btnShare.classList.add('danger');
         btnCopyLink.style.display = 'inline-flex';
-        stageTitle.innerText = 'Você está transmitindo sua tela (60 FPS)';
+        stageTitle.innerText = 'Você está transmitindo sua tela';
         liveBadge.style.display = 'inline-block';
         emptyState.style.display = 'none';
 
         videoEl.srcObject = localStream;
         videoEl.muted = true;
-        videoEl.play();
+        videoEl.play().catch(() => {});
 
-        videoTrack.onended = () => stopShare();
+        const settings = videoTrack ? videoTrack.getSettings() : {};
+        const width = settings.width || QUALITY.width;
+        const height = settings.height || QUALITY.height;
+        const fps = Math.round(settings.frameRate || QUALITY.fps);
+        statusBadge.innerText =
+          '⚡ ' + width + '×' + height + ' • ' + fps + ' FPS • ' +
+          (turnConfigured ? 'TURN pronto' : 'P2P/STUN');
 
-        ws.send(JSON.stringify({ type: 'LIVE_STATE_CHANGE', isLive: true }));
+        if (videoTrack) videoTrack.onended = () => stopShare();
 
+        wsSend({ type: 'LIVE_STATE_CHANGE', isLive: true });
       } catch (err) {
         console.error('Erro ao capturar tela:', err);
+        statusBadge.innerText = '⚠️ Captura cancelada ou indisponível';
       }
     }
 
     function stopShare() {
+      if (!isSharing && !localStream) return;
+
+      for (const viewerId of Array.from(senderPeers.keys())) {
+        closeSenderPeer(viewerId);
+      }
+
       if (localStream) {
-        localStream.getTracks().forEach(t => t.stop());
+        localStream.getTracks().forEach((track) => {
+          try { track.stop(); } catch (_) {}
+        });
         localStream = null;
       }
-      senderPCs.forEach(pc => pc.close());
-      senderPCs.clear();
-      senderQueues.clear();
-      senderRemoteReady.clear();
 
       isSharing = false;
       btnShare.innerText = 'Transmitir Tela';
@@ -551,114 +1056,511 @@ app.get('/', (req, res) => {
       liveBadge.style.display = 'none';
       videoEl.srcObject = null;
       emptyState.style.display = 'block';
+      statusBadge.innerText = '⚡ Full HD • 60 FPS • Auto';
 
-      ws.send(JSON.stringify({ type: 'LIVE_STATE_CHANGE', isLive: false }));
+      wsSend({ type: 'LIVE_STATE_CHANGE', isLive: false });
     }
 
     async function initiateStreamToViewer(viewerId) {
+      if (!isSharing || !localStream || !viewerId) return;
+
+      await refreshRtcConfig(false);
+      closeSenderPeer(viewerId);
+
       const pc = new RTCPeerConnection(rtcConfig);
-      senderPCs.set(viewerId, pc);
-      senderQueues.set(viewerId, []);
-      senderRemoteReady.set(viewerId, false);
+      const sessionId = createSessionId();
 
-      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      const peer = {
+        pc,
+        sessionId,
+        remoteReady: false,
+        remoteCandidates: [],
+        localCandidates: [],
+        signalReady: false,
+        videoSender: null,
+        statsTimer: null,
+        reconnectTimer: null,
+        targetBitrate: QUALITY.maxBitrate,
+        weakSamples: 0,
+        strongSamples: 0,
+        lastBytesSent: null,
+        lastStatsAt: null,
+        closed: false
+      };
 
-      pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          ws.send(JSON.stringify({ type: 'CANDIDATE', target: viewerId, candidate: e.candidate }));
+      senderPeers.set(viewerId, peer);
+
+      const videoTrack = localStream.getVideoTracks()[0];
+      const audioTracks = localStream.getAudioTracks();
+
+      if (videoTrack) {
+        try {
+          const transceiver = pc.addTransceiver(videoTrack, {
+            direction: 'sendonly',
+            streams: [localStream],
+            sendEncodings: [{
+              maxBitrate: QUALITY.maxBitrate,
+              maxFramerate: QUALITY.fps,
+              scaleResolutionDownBy: 1
+            }]
+          });
+          peer.videoSender = transceiver.sender;
+          preferScreenShareCodecs(transceiver);
+        } catch (err) {
+          console.warn('addTransceiver avançado indisponível; usando addTrack:', err.message);
+          peer.videoSender = pc.addTrack(videoTrack, localStream);
+        }
+      }
+
+      audioTracks.forEach((track) => pc.addTrack(track, localStream));
+
+      pc.onicecandidate = (event) => {
+        if (!event.candidate || peer.closed) return;
+
+        const packet = {
+          type: 'CANDIDATE',
+          target: viewerId,
+          sessionId,
+          candidate: event.candidate
+        };
+
+        if (!peer.signalReady) peer.localCandidates.push(packet);
+        else wsSend(packet);
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (peer.closed) return;
+        const state = pc.connectionState;
+
+        if (state === 'connected') {
+          if (peer.reconnectTimer) {
+            clearTimeout(peer.reconnectTimer);
+            peer.reconnectTimer = null;
+          }
+        } else if (state === 'failed') {
+          scheduleSenderPeerRecovery(viewerId, peer, 500);
+        } else if (state === 'disconnected') {
+          scheduleSenderPeerRecovery(viewerId, peer, 3000);
         }
       };
+
+      await applyVideoSenderProfile(peer.videoSender, QUALITY.maxBitrate);
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      ws.send(JSON.stringify({ type: 'OFFER', target: viewerId, sdp: pc.localDescription }));
+      if (peer.closed || senderPeers.get(viewerId) !== peer) return;
+
+      wsSend({
+        type: 'OFFER',
+        target: viewerId,
+        sessionId,
+        sdp: pc.localDescription,
+        quality: {
+          width: QUALITY.width,
+          height: QUALITY.height,
+          fps: QUALITY.fps,
+          maxBitrate: QUALITY.maxBitrate
+        }
+      });
+
+      peer.signalReady = true;
+      while (peer.localCandidates.length) {
+        wsSend(peer.localCandidates.shift());
+      }
     }
 
-    // --- RECEBENDO A TRANSMISSÃO (CORREÇÃO DA TELA PRETA) ---
-    async function handleIncomingOffer(data) {
-      if (activePC) {
-        activePC.close();
-      }
-      activePC = new RTCPeerConnection(rtcConfig);
-      activePCRemoteReady = false;
+    function scheduleSenderPeerRecovery(viewerId, peer, delay) {
+      if (peer.closed || peer.reconnectTimer || !isSharing) return;
 
-      // Cria ou reutiliza o MediaStream para que Áudio E Vídeo funcionem juntos
+      peer.reconnectTimer = setTimeout(() => {
+        peer.reconnectTimer = null;
+        if (peer.closed || senderPeers.get(viewerId) !== peer || !isSharing) return;
+        initiateStreamToViewer(viewerId).catch(console.warn);
+      }, delay);
+    }
+
+    async function handleSenderAnswer(data) {
+      const peer = senderPeers.get(data.from);
+      if (!peer || peer.closed) return;
+      if (data.sessionId !== peer.sessionId) return;
+
+      try {
+        await peer.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        peer.remoteReady = true;
+
+        while (peer.remoteCandidates.length) {
+          const candidate = peer.remoteCandidates.shift();
+          await peer.pc.addIceCandidate(candidate).catch(console.warn);
+        }
+
+        await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate);
+        startSenderQualityManager(data.from, peer);
+      } catch (err) {
+        console.warn('Erro ao aplicar ANSWER:', err.message);
+        scheduleSenderPeerRecovery(data.from, peer, 700);
+      }
+    }
+
+    function closeSenderPeer(viewerId) {
+      const peer = senderPeers.get(viewerId);
+      if (!peer) return;
+
+      peer.closed = true;
+      if (peer.statsTimer) clearInterval(peer.statsTimer);
+      if (peer.reconnectTimer) clearTimeout(peer.reconnectTimer);
+
+      try {
+        peer.pc.onicecandidate = null;
+        peer.pc.onconnectionstatechange = null;
+        peer.pc.close();
+      } catch (_) {}
+
+      senderPeers.delete(viewerId);
+
+      if (isSharing && senderPeers.size === 0 && localStream) {
+        const track = localStream.getVideoTracks()[0];
+        const settings = track ? track.getSettings() : {};
+        statusBadge.innerText =
+          '⚡ ' + (settings.width || QUALITY.width) + '×' + (settings.height || QUALITY.height) +
+          ' • ' + Math.round(settings.frameRate || QUALITY.fps) + ' FPS • Aguardando espectador';
+      }
+    }
+
+    async function startSenderQualityManager(viewerId, peer) {
+      if (peer.statsTimer) clearInterval(peer.statsTimer);
+
+      peer.statsTimer = setInterval(async () => {
+        if (peer.closed || peer.pc.connectionState !== 'connected') return;
+
+        try {
+          const report = await peer.pc.getStats();
+          let outbound = null;
+          let pair = null;
+
+          report.forEach((stat) => {
+            if (stat.type === 'outbound-rtp' && stat.kind === 'video' && !stat.isRemote) outbound = stat;
+            if (stat.type === 'candidate-pair' && stat.state === 'succeeded' && stat.nominated) pair = stat;
+          });
+
+          if (!outbound) return;
+
+          const now = performance.now();
+          let currentMbps = null;
+
+          if (peer.lastBytesSent !== null && peer.lastStatsAt !== null) {
+            const seconds = Math.max(0.001, (now - peer.lastStatsAt) / 1000);
+            currentMbps = ((outbound.bytesSent - peer.lastBytesSent) * 8 / seconds) / 1_000_000;
+          }
+
+          peer.lastBytesSent = outbound.bytesSent;
+          peer.lastStatsAt = now;
+
+          const available = Number(pair && pair.availableOutgoingBitrate || 0);
+          if (available > 0) {
+            if (available < peer.targetBitrate * 0.65) {
+              peer.weakSamples += 1;
+              peer.strongSamples = 0;
+            } else if (available > peer.targetBitrate * 1.35) {
+              peer.strongSamples += 1;
+              peer.weakSamples = 0;
+            } else {
+              peer.weakSamples = 0;
+              peer.strongSamples = 0;
+            }
+
+            if (peer.weakSamples >= 3) {
+              peer.targetBitrate = Math.max(
+                QUALITY.minBitrate,
+                Math.min(QUALITY.maxBitrate, Math.floor(available * 0.90))
+              );
+              peer.weakSamples = 0;
+              await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate);
+            } else if (peer.strongSamples >= 3 && peer.targetBitrate < QUALITY.maxBitrate) {
+              peer.targetBitrate = Math.min(
+                QUALITY.maxBitrate,
+                Math.max(peer.targetBitrate + 2_000_000, Math.floor(available * 0.80))
+              );
+              peer.strongSamples = 0;
+              await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate);
+            }
+          }
+
+          if (isSharing) {
+            const fps = Math.round(outbound.framesPerSecond || QUALITY.fps);
+            const width = outbound.frameWidth || QUALITY.width;
+            const height = outbound.frameHeight || QUALITY.height;
+            const mbpsText = currentMbps === null ? 'iniciando' : currentMbps.toFixed(1) + ' Mbps';
+
+            statusBadge.innerText =
+              '⚡ ' + width + '×' + height + ' • ' + fps + ' FPS • ' +
+              mbpsText + ' • ' + senderPeers.size + ' espectador(es)';
+          }
+        } catch (_) {}
+      }, QUALITY.statsIntervalMs);
+    }
+
+    // --- RECEBENDO A TRANSMISSÃO ---
+    async function handleIncomingOffer(data) {
+      if (!data.from || !data.sessionId || !data.sdp) return;
+
+      await refreshRtcConfig(false);
+      closeViewerConnection(false);
+
+      activeBroadcasterId = data.from;
+      activeSessionId = data.sessionId;
+      desiredWatchId = data.from;
+      activePCRemoteReady = false;
+      activePCQueue = [];
+      viewerLocalCandidates = [];
+      viewerSignalReady = false;
+
+      const pc = new RTCPeerConnection(rtcConfig);
+      activePC = pc;
+
       const remoteMediaStream = new MediaStream();
       videoEl.srcObject = remoteMediaStream;
 
-      activePC.ontrack = (event) => {
-        remoteMediaStream.addTrack(event.track);
+      pc.ontrack = (event) => {
+        if (activePC !== pc) return;
 
-        // Força play imediato assim que os quadros de vídeo chegarem
+        if (!remoteMediaStream.getTracks().some((t) => t.id === event.track.id)) {
+          remoteMediaStream.addTrack(event.track);
+        }
+
         videoEl.muted = true;
         videoEl.play().catch(() => {
           unmuteNotice.style.display = 'block';
         });
 
         event.track.onunmute = () => {
-          videoEl.play().catch(() => {});
+          if (activePC === pc) videoEl.play().catch(() => {});
         };
 
         emptyState.style.display = 'none';
         stageTitle.innerText = 'Assistindo tela de ' + (data.fromNick || data.from);
         liveBadge.style.display = 'inline-block';
         btnDisconnect.style.display = 'flex';
-        unmuteNotice.style.display = 'block';
-      };
 
-      activePC.onicecandidate = (e) => {
-        if (e.candidate) {
-          ws.send(JSON.stringify({ type: 'CANDIDATE', target: data.from, candidate: e.candidate }));
+        if (event.track.kind === 'audio') {
+          unmuteNotice.style.display = 'block';
         }
       };
 
-      // Monitor de conexão ICE para feedback visual
-      activePC.oniceconnectionstatechange = () => {
-        if (activePC.iceConnectionState === 'connected') {
-          statusBadge.innerText = '⚡ Conectado P2P • 60 FPS';
-        } else if (activePC.iceConnectionState === 'checking') {
-          statusBadge.innerText = '🔄 Conectando P2P...';
-        } else if (activePC.iceConnectionState === 'failed') {
-          statusBadge.innerText = '⚠️ Reconectando via TURN...';
-          activePC.restartIce();
+      pc.onicecandidate = (event) => {
+        if (!event.candidate || activePC !== pc) return;
+
+        const packet = {
+          type: 'CANDIDATE',
+          target: data.from,
+          sessionId: data.sessionId,
+          candidate: event.candidate
+        };
+
+        if (!viewerSignalReady) viewerLocalCandidates.push(packet);
+        else wsSend(packet);
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (activePC !== pc) return;
+
+        const state = pc.connectionState;
+        if (state === 'connected') {
+          viewerRecoveryAttempts = 0;
+          if (viewerRecoveryTimer) {
+            clearTimeout(viewerRecoveryTimer);
+            viewerRecoveryTimer = null;
+          }
+          startViewerStats(pc);
+        } else if (state === 'connecting') {
+          statusBadge.innerText = '🔄 Conectando WebRTC...';
+        } else if (state === 'failed') {
+          statusBadge.innerText = '⚠️ Reconectando rota de internet...';
+          scheduleViewerRecovery(400);
+        } else if (state === 'disconnected') {
+          statusBadge.innerText = '🟡 Rede instável • tentando recuperar...';
+          scheduleViewerRecovery(2500);
         }
       };
 
-      await activePC.setRemoteDescription(new RTCSessionDescription(data.sdp));
-      activePCRemoteReady = true;
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        activePCRemoteReady = true;
 
-      // Esvazia candidatos que chegaram antes da descrição remota
-      while (activePCQueue.length > 0) {
-        const c = activePCQueue.shift();
-        await activePC.addIceCandidate(c).catch(console.warn);
+        while (activePCQueue.length) {
+          const candidate = activePCQueue.shift();
+          await pc.addIceCandidate(candidate).catch(console.warn);
+        }
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        if (activePC !== pc) return;
+
+        wsSend({
+          type: 'ANSWER',
+          target: data.from,
+          sessionId: data.sessionId,
+          sdp: pc.localDescription
+        });
+
+        viewerSignalReady = true;
+        while (viewerLocalCandidates.length) {
+          wsSend(viewerLocalCandidates.shift());
+        }
+      } catch (err) {
+        console.warn('Erro ao receber OFFER:', err.message);
+        scheduleViewerRecovery(700);
+      }
+    }
+
+    async function handleRemoteCandidate(data) {
+      if (!data.candidate || !data.sessionId) return;
+
+      // Candidato do transmissor -> espectador.
+      if (
+        activePC &&
+        data.from === activeBroadcasterId &&
+        data.sessionId === activeSessionId
+      ) {
+        if (!activePCRemoteReady) {
+          activePCQueue.push(data.candidate);
+        } else {
+          await activePC.addIceCandidate(data.candidate).catch(console.warn);
+        }
+        return;
       }
 
-      const answer = await activePC.createAnswer();
-      await activePC.setLocalDescription(answer);
+      // Candidato do espectador -> transmissor.
+      const peer = senderPeers.get(data.from);
+      if (!peer || peer.closed || data.sessionId !== peer.sessionId) return;
 
-      ws.send(JSON.stringify({ type: 'ANSWER', target: data.from, sdp: activePC.localDescription }));
+      if (!peer.remoteReady) {
+        peer.remoteCandidates.push(data.candidate);
+      } else {
+        await peer.pc.addIceCandidate(data.candidate).catch(console.warn);
+      }
+    }
+
+    function scheduleViewerRecovery(delay) {
+      if (!desiredWatchId || isSharing || viewerRecoveryTimer) return;
+
+      viewerRecoveryAttempts += 1;
+      const backoff = Math.min(6000, delay * Math.max(1, viewerRecoveryAttempts));
+
+      viewerRecoveryTimer = setTimeout(() => {
+        viewerRecoveryTimer = null;
+        const target = desiredWatchId;
+        closeViewerConnection(false);
+        if (target) requestWatch(target, true);
+      }, backoff);
+    }
+
+    function startViewerStats(pc) {
+      if (viewerStatsTimer) clearInterval(viewerStatsTimer);
+
+      let lastBytes = null;
+      let lastAt = null;
+
+      viewerStatsTimer = setInterval(async () => {
+        if (activePC !== pc || pc.connectionState !== 'connected') return;
+
+        try {
+          const report = await pc.getStats();
+          let inbound = null;
+          let pair = null;
+          let localCandidate = null;
+          let remoteCandidate = null;
+
+          report.forEach((stat) => {
+            if (stat.type === 'inbound-rtp' && stat.kind === 'video' && !stat.isRemote) inbound = stat;
+            if (stat.type === 'candidate-pair' && stat.state === 'succeeded' && stat.nominated) pair = stat;
+          });
+
+          if (pair) {
+            localCandidate = report.get(pair.localCandidateId);
+            remoteCandidate = report.get(pair.remoteCandidateId);
+          }
+
+          if (!inbound) return;
+
+          const now = performance.now();
+          let mbps = null;
+
+          if (lastBytes !== null && lastAt !== null) {
+            const seconds = Math.max(0.001, (now - lastAt) / 1000);
+            mbps = ((inbound.bytesReceived - lastBytes) * 8 / seconds) / 1_000_000;
+          }
+
+          lastBytes = inbound.bytesReceived;
+          lastAt = now;
+
+          const width = inbound.frameWidth || QUALITY.width;
+          const height = inbound.frameHeight || QUALITY.height;
+          const fps = Math.round(inbound.framesPerSecond || 0);
+          const relay =
+            (localCandidate && localCandidate.candidateType === 'relay') ||
+            (remoteCandidate && remoteCandidate.candidateType === 'relay');
+
+          statusBadge.innerText =
+            '⚡ ' + width + '×' + height +
+            ' • ' + (fps || '—') + ' FPS' +
+            (mbps === null ? '' : ' • ' + mbps.toFixed(1) + ' Mbps') +
+            ' • ' + (relay ? 'TURN global' : 'P2P direto');
+        } catch (_) {}
+      }, QUALITY.statsIntervalMs);
+    }
+
+    function closeViewerConnection(sendStop) {
+      const oldBroadcaster = activeBroadcasterId;
+
+      if (viewerRecoveryTimer) {
+        clearTimeout(viewerRecoveryTimer);
+        viewerRecoveryTimer = null;
+      }
+      if (viewerStatsTimer) {
+        clearInterval(viewerStatsTimer);
+        viewerStatsTimer = null;
+      }
+
+      if (sendStop && oldBroadcaster) {
+        wsSend({ type: 'STOP_WATCH', target: oldBroadcaster });
+      }
+
+      if (activePC) {
+        try {
+          activePC.ontrack = null;
+          activePC.onicecandidate = null;
+          activePC.onconnectionstatechange = null;
+          activePC.close();
+        } catch (_) {}
+      }
+
+      activePC = null;
+      activeBroadcasterId = null;
+      activeSessionId = null;
+      activePCRemoteReady = false;
+      activePCQueue = [];
+      viewerLocalCandidates = [];
+      viewerSignalReady = false;
     }
 
     function disconnectStream() {
-      if (activePC) {
-        activePC.close();
-        activePC = null;
-      }
-      activePCQueue = [];
-      activePCRemoteReady = false;
+      desiredWatchId = null;
+      closeViewerConnection(true);
+
       videoEl.srcObject = null;
       emptyState.style.display = 'block';
       stageTitle.innerText = 'Nenhuma transmissão em andamento';
       liveBadge.style.display = 'none';
       btnDisconnect.style.display = 'none';
       unmuteNotice.style.display = 'none';
-      statusBadge.innerText = '⚡ 60 FPS • Full HD';
+      statusBadge.innerText = '⚡ Full HD • 60 FPS • Auto';
     }
 
     // --- COPIAR LINK DA LIVE ---
     function copyStreamLink() {
-      const liveUrl = window.location.origin + '/?watch=' + myId;
+      const liveUrl = window.location.origin + '/?watch=' + encodeURIComponent(myId);
       navigator.clipboard.writeText(liveUrl).then(() => {
         alert('📋 Link da Live copiado! Envie para seus amigos:\\n' + liveUrl);
       }).catch(() => {
@@ -666,34 +1568,34 @@ app.get('/', (req, res) => {
       });
     }
 
-    // --- SISTEMA DE AMIZADES DISCORD ---
+    // --- SISTEMA DE AMIZADES ---
     function sendFriendRequestPrompt() {
-      const targetId = prompt("Digite o ID do seu amigo (ex: dc-12345):");
+      const targetId = prompt('Digite o ID do seu amigo (ex: dc-12345):');
       if (!targetId) return;
       const cleanId = targetId.trim().toLowerCase();
 
       if (cleanId === myId) {
-        alert("Você não pode adicionar seu próprio ID!");
+        alert('Você não pode adicionar seu próprio ID!');
         return;
       }
 
-      ws.send(JSON.stringify({
-        type: 'FRIEND_REQUEST',
-        targetId: cleanId
-      }));
+      if (!wsSend({ type: 'FRIEND_REQUEST', targetId: cleanId })) {
+        alert('Sem conexão com o servidor. Tente novamente quando reconectar.');
+        return;
+      }
 
-      alert("Pedido de amizade enviado para " + cleanId + "!");
+      alert('Pedido de amizade enviado para ' + cleanId + '!');
     }
 
     function respondFriendRequest(accepted) {
       document.getElementById('friendRequestModal').style.display = 'none';
       if (!pendingRequestFrom) return;
 
-      ws.send(JSON.stringify({
+      wsSend({
         type: 'FRIEND_RESPONSE',
         targetId: pendingRequestFrom.id,
-        accepted
-      }));
+        accepted: Boolean(accepted)
+      });
 
       if (accepted) {
         addFriendToLocal(pendingRequestFrom.id, pendingRequestFrom.nick);
@@ -702,12 +1604,20 @@ app.get('/', (req, res) => {
     }
 
     function addFriendToLocal(id, name) {
-      id = id.toLowerCase();
-      if (!friends.some(f => f.id.toLowerCase() === id)) {
-        friends.push({ id, name });
-        localStorage.setItem('dc_saved_friends', JSON.stringify(friends));
-        renderFriends();
+      id = String(id || '').trim().toLowerCase();
+      if (!id) return;
+
+      const safeName = String(name || ('Amigo#' + id.slice(-4))).slice(0, 48);
+
+      const existing = friends.find((f) => String(f.id || '').toLowerCase() === id);
+      if (existing) {
+        if (name && existing.name !== safeName) existing.name = safeName;
+      } else {
+        friends.push({ id, name: safeName });
       }
+
+      localStorage.setItem('dc_saved_friends', JSON.stringify(friends));
+      renderFriends();
     }
 
     function removeFriend(idx) {
@@ -718,55 +1628,129 @@ app.get('/', (req, res) => {
 
     function renderFriends() {
       const container = document.getElementById('friendsContainer');
-      container.innerHTML = '<div class="section-title">Lista de Amigos</div>';
+      container.innerHTML = '';
+
+      const title = document.createElement('div');
+      title.className = 'section-title';
+      title.textContent = 'Lista de Amigos';
+      container.appendChild(title);
 
       if (friends.length === 0) {
-        container.innerHTML += '<div style="font-size: 12px; color: var(--text-muted); padding: 8px;">Nenhum amigo ainda. Clique em "+ Adicionar".</div>';
+        const empty = document.createElement('div');
+        empty.style.cssText = 'font-size:12px;color:var(--text-muted);padding:8px;';
+        empty.textContent = 'Nenhum amigo ainda. Clique em "+ Adicionar".';
+        container.appendChild(empty);
         return;
       }
 
-      friends.forEach((f, idx) => {
-        const isLive = liveFriendIds.has(f.id.toLowerCase());
+      friends.forEach((friend, idx) => {
+        const id = String(friend.id || '').toLowerCase();
+        const name = String(friend.name || ('Amigo#' + id.slice(-4)));
+        const isLive = liveFriendIds.has(id);
+
         const item = document.createElement('div');
         item.className = 'friend-item';
-        item.innerHTML = \`
-          <div class="friend-info">
-            <div class="avatar">\${f.name.charAt(0).toUpperCase()}<div class="status-dot"></div></div>
-            <div>
-              <div class="friend-name">\${f.name}</div>
-              <div class="friend-id">\${f.id}</div>
-            </div>
-          </div>
-          <div class="friend-actions">
-            \${isLive ? \`<button class="btn-action live" onclick="requestWatch('\${f.id}')">🔴 AO VIVO</button>\` : \`<button class="btn-action watch" onclick="requestWatch('\${f.id}')">Assistir</button>\`}
-            <button class="btn-action del" onclick="removeFriend(\${idx})">✕</button>
-          </div>
-        \`;
+
+        const info = document.createElement('div');
+        info.className = 'friend-info';
+
+        const avatar = document.createElement('div');
+        avatar.className = 'avatar';
+        avatar.textContent = (name.charAt(0) || '?').toUpperCase();
+
+        const dot = document.createElement('div');
+        dot.className = 'status-dot';
+        avatar.appendChild(dot);
+
+        const textWrap = document.createElement('div');
+        const nameEl = document.createElement('div');
+        nameEl.className = 'friend-name';
+        nameEl.textContent = name;
+
+        const idEl = document.createElement('div');
+        idEl.className = 'friend-id';
+        idEl.textContent = id;
+
+        textWrap.appendChild(nameEl);
+        textWrap.appendChild(idEl);
+        info.appendChild(avatar);
+        info.appendChild(textWrap);
+
+        const actions = document.createElement('div');
+        actions.className = 'friend-actions';
+
+        const watchBtn = document.createElement('button');
+        watchBtn.className = 'btn-action ' + (isLive ? 'live' : 'watch');
+        watchBtn.textContent = isLive ? '🔴 AO VIVO' : 'Assistir';
+        watchBtn.addEventListener('click', () => requestWatch(id, false));
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'btn-action del';
+        delBtn.textContent = '✕';
+        delBtn.addEventListener('click', () => removeFriend(idx));
+
+        actions.appendChild(watchBtn);
+        actions.appendChild(delBtn);
+
+        item.appendChild(info);
+        item.appendChild(actions);
         container.appendChild(item);
       });
     }
 
-    function requestWatch(friendId) {
-      friendId = friendId.toLowerCase();
-      addFriendToLocal(friendId, 'Amigo#' + friendId.slice(-4));
-      ws.send(JSON.stringify({ type: 'REQUEST_STREAM', target: friendId }));
+    function requestWatch(friendId, fromReconnect) {
+      friendId = String(friendId || '').trim().toLowerCase();
+      if (!friendId || friendId === myId || isSharing) return;
+
+      if (!fromReconnect) {
+        addFriendToLocal(friendId, 'Amigo#' + friendId.slice(-4));
+      }
+
+      if (activeBroadcasterId && activeBroadcasterId !== friendId) {
+        closeViewerConnection(true);
+      }
+
+      desiredWatchId = friendId;
+      statusBadge.innerText = '🔄 Solicitando transmissão...';
+
+      if (!wsSend({ type: 'REQUEST_STREAM', target: friendId })) {
+        scheduleReconnect();
+      }
     }
 
     function copyMyId() {
       navigator.clipboard.writeText(myId).then(() => {
-        alert("Seu ID copiado: " + myId + "\\nEnvie para seu amigo te adicionar!");
+        alert('Seu ID copiado: ' + myId + '\\nEnvie para seu amigo te adicionar!');
+      }).catch(() => {
+        prompt('Copie seu ID:', myId);
       });
     }
 
     function unmute() {
       videoEl.muted = false;
       unmuteNotice.style.display = 'none';
+      videoEl.play().catch(() => {});
     }
 
     function toggleFullscreen() {
-      if (!document.fullscreenElement) document.querySelector('.video-viewport').requestFullscreen();
-      else document.exitFullscreen();
+      const viewport = document.querySelector('.video-viewport');
+      if (!document.fullscreenElement) {
+        viewport.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
     }
+
+    // Link direto ?watch=dc-12345
+    const initialParams = new URLSearchParams(window.location.search);
+    const initialWatchId = String(initialParams.get('watch') || '').trim().toLowerCase();
+    if (initialWatchId && initialWatchId !== myId) desiredWatchId = initialWatchId;
+
+    window.addEventListener('beforeunload', () => {
+      if (activeBroadcasterId) {
+        wsSend({ type: 'STOP_WATCH', target: activeBroadcasterId });
+      }
+    });
 
     renderFriends();
   </script>
@@ -775,6 +1759,28 @@ app.get('/', (req, res) => {
   `);
 });
 
-server.listen(PORT, () => {
-  console.log('Servidor Discord ativo na porta: ' + PORT);
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 125000;
+
+let shuttingDown = false;
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(signal + ' recebido. Encerrando conexões com segurança...');
+
+  for (const ws of wss.clients) {
+    safeSend(ws, { type: 'SERVER_RESTARTING', appVersion: APP_VERSION });
+    try { ws.close(1012, 'Service restart'); } catch (_) {}
+  }
+
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 10000).unref();
+}
+
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log('Servidor Discord ativo na porta: ' + PORT + ' | versão ' + APP_VERSION);
 });
