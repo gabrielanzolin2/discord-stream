@@ -964,6 +964,7 @@ app.get('/', (req, res) => {
     let viewerSignalReady = false;
     let viewerStatsTimer = null;
     let viewerRecoveryTimer = null;
+    let viewerConnectTimer = null;
     let viewerRecoveryAttempts = 0;
     let desiredWatchId = null;
     let wsSessionToken = null;
@@ -1429,35 +1430,27 @@ app.get('/', (req, res) => {
       setConnectionUi('offline');
     });
 
-    // --- WEBRTC: CODECS E PERFIL DE ALTA QUALIDADE ---
-    function preferScreenShareCodecs(transceiver) {
-      if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
-      if (!window.RTCRtpSender || typeof RTCRtpSender.getCapabilities !== 'function') return;
+    // --- WEBRTC: NEGOCIAÇÃO COMPATÍVEL + PERFIL DE QUALIDADE ---
+    // Não forçamos ordem de codecs. Deixamos cada navegador negociar o melhor
+    // codec em comum, o que reduz casos de conexão sem vídeo entre dispositivos.
+    function waitForIceGathering(pc, timeoutMs = 3000) {
+      if (!pc || pc.iceGatheringState === 'complete') return Promise.resolve(true);
 
-      try {
-        const caps = RTCRtpSender.getCapabilities('video');
-        if (!caps || !Array.isArray(caps.codecs)) return;
-
-        const rank = {
-          'video/VP9': 0,
-          'video/H264': 1,
-          'video/VP8': 2,
-          'video/AV1': 3
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = (complete) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          try { pc.removeEventListener('icegatheringstatechange', onChange); } catch (_) {}
+          resolve(complete);
         };
-
-        const primary = [];
-        const auxiliary = [];
-
-        caps.codecs.forEach((codec) => {
-          if (Object.prototype.hasOwnProperty.call(rank, codec.mimeType)) primary.push(codec);
-          else auxiliary.push(codec);
-        });
-
-        primary.sort((a, b) => rank[a.mimeType] - rank[b.mimeType]);
-        transceiver.setCodecPreferences(primary.concat(auxiliary));
-      } catch (err) {
-        console.warn('Não foi possível ajustar preferência de codec:', err.message);
-      }
+        const onChange = () => {
+          if (pc.iceGatheringState === 'complete') finish(true);
+        };
+        const timer = setTimeout(() => finish(pc.iceGatheringState === 'complete'), timeoutMs);
+        pc.addEventListener('icegatheringstatechange', onChange);
+      });
     }
 
     async function applyVideoSenderProfile(sender, targetBitrate) {
@@ -1653,6 +1646,7 @@ app.get('/', (req, res) => {
         videoSender: null,
         statsTimer: null,
         reconnectTimer: null,
+        connectTimer: null,
         forceRelay,
         recoveryAttempts,
         budgetCap: perViewerBitrateBudget(),
@@ -1671,22 +1665,9 @@ app.get('/', (req, res) => {
       const audioTracks = localStream.getAudioTracks();
 
       if (videoTrack) {
-        try {
-          const transceiver = pc.addTransceiver(videoTrack, {
-            direction: 'sendonly',
-            streams: [localStream],
-            sendEncodings: [{
-              maxBitrate: peer.targetBitrate,
-              maxFramerate: QUALITY.fps,
-              scaleResolutionDownBy: 1
-            }]
-          });
-          peer.videoSender = transceiver.sender;
-          preferScreenShareCodecs(transceiver);
-        } catch (err) {
-          console.warn('addTransceiver avançado indisponível; usando addTrack:', err.message);
-          peer.videoSender = pc.addTrack(videoTrack, localStream);
-        }
+        // addTrack() é o caminho mais interoperável para screen sharing entre
+        // navegadores/dispositivos diferentes. O bitrate é aplicado depois.
+        peer.videoSender = pc.addTrack(videoTrack, localStream);
       }
 
       audioTracks.forEach((track) => pc.addTrack(track, localStream));
@@ -1705,21 +1686,37 @@ app.get('/', (req, res) => {
         else wsSend(packet);
       };
 
+      const markSenderConnected = () => {
+        if (peer.closed) return;
+        peer.recoveryAttempts = 0;
+        if (peer.reconnectTimer) {
+          clearTimeout(peer.reconnectTimer);
+          peer.reconnectTimer = null;
+        }
+        if (peer.connectTimer) {
+          clearTimeout(peer.connectTimer);
+          peer.connectTimer = null;
+        }
+      };
+
       pc.onconnectionstatechange = () => {
         if (peer.closed) return;
         const state = pc.connectionState;
+        if (state === 'connected') markSenderConnected();
+        else if (state === 'failed') scheduleSenderPeerRecovery(viewerId, peer, 300);
+        else if (state === 'disconnected') scheduleSenderPeerRecovery(viewerId, peer, 1800);
+      };
 
-        if (state === 'connected') {
-          peer.recoveryAttempts = 0;
-          if (peer.reconnectTimer) {
-            clearTimeout(peer.reconnectTimer);
-            peer.reconnectTimer = null;
-          }
-        } else if (state === 'failed') {
-          scheduleSenderPeerRecovery(viewerId, peer, 500);
-        } else if (state === 'disconnected') {
-          scheduleSenderPeerRecovery(viewerId, peer, 3000);
-        }
+      pc.oniceconnectionstatechange = () => {
+        if (peer.closed) return;
+        const state = pc.iceConnectionState;
+        if (state === 'connected' || state === 'completed') markSenderConnected();
+        else if (state === 'failed') scheduleSenderPeerRecovery(viewerId, peer, 300);
+      };
+
+      pc.onicecandidateerror = (event) => {
+        if (peer.closed) return;
+        console.warn('ICE sender error:', event.errorCode || '', event.errorText || '');
       };
 
       await rebalanceSenderBitrates();
@@ -1727,6 +1724,10 @@ app.get('/', (req, res) => {
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+
+      // Dá uma pequena janela para colocar candidatos ICE diretamente no SDP.
+      // Isso torna a conexão mais robusta quando o trickle ICE sofre atraso.
+      const gatheredCompletely = await waitForIceGathering(pc, peer.forceRelay ? 4500 : 2800);
 
       if (peer.closed || senderPeers.get(viewerId) !== peer) return;
 
@@ -1745,9 +1746,20 @@ app.get('/', (req, res) => {
       });
 
       peer.signalReady = true;
-      while (peer.localCandidates.length) {
-        wsSend(peer.localCandidates.shift());
+      if (gatheredCompletely) {
+        // Os candidatos já estão no SDP; evita mandar duplicados.
+        peer.localCandidates.length = 0;
+      } else {
+        while (peer.localCandidates.length) wsSend(peer.localCandidates.shift());
       }
+
+      // connectionState pode permanecer em 'connecting' por bastante tempo em
+      // NAT/firewall ruim. Não deixamos a tentativa travar indefinidamente.
+      peer.connectTimer = setTimeout(() => {
+        if (peer.closed || senderPeers.get(viewerId) !== peer) return;
+        if (pc.connectionState === 'connected' || ['connected', 'completed'].includes(pc.iceConnectionState)) return;
+        scheduleSenderPeerRecovery(viewerId, peer, 0);
+      }, peer.forceRelay ? 14000 : 10000);
     }
 
     function scheduleSenderPeerRecovery(viewerId, peer, delay) {
@@ -1791,9 +1803,12 @@ app.get('/', (req, res) => {
       peer.closed = true;
       if (peer.statsTimer) clearInterval(peer.statsTimer);
       if (peer.reconnectTimer) clearTimeout(peer.reconnectTimer);
+      if (peer.connectTimer) clearTimeout(peer.connectTimer);
 
       try {
         peer.pc.onicecandidate = null;
+        peer.pc.onicecandidateerror = null;
+        peer.pc.oniceconnectionstatechange = null;
         peer.pc.onconnectionstatechange = null;
         peer.pc.close();
       } catch (_) {}
@@ -1919,32 +1934,42 @@ app.get('/', (req, res) => {
       renderAudience();
 
       const remoteMediaStream = new MediaStream();
+      videoEl.autoplay = true;
+      videoEl.playsInline = true;
+      videoEl.muted = true;
       videoEl.srcObject = remoteMediaStream;
+
+      const ensureRemotePlayback = () => {
+        if (activePC !== pc) return;
+        videoEl.play().catch(() => {
+          // Vídeo mutado deveria tocar automaticamente; se o navegador bloquear,
+          // mantemos a sessão ativa e permitimos interação manual.
+          unmuteNotice.style.display = 'block';
+        });
+      };
 
       pc.ontrack = (event) => {
         if (activePC !== pc) return;
 
-        if (!remoteMediaStream.getTracks().some((t) => t.id === event.track.id)) {
+        const incomingStream = event.streams && event.streams[0];
+        if (incomingStream) {
+          if (videoEl.srcObject !== incomingStream) videoEl.srcObject = incomingStream;
+        } else if (!remoteMediaStream.getTracks().some((t) => t.id === event.track.id)) {
           remoteMediaStream.addTrack(event.track);
+          if (videoEl.srcObject !== remoteMediaStream) videoEl.srcObject = remoteMediaStream;
         }
 
-        videoEl.muted = true;
-        videoEl.play().catch(() => {
-          unmuteNotice.style.display = 'block';
-        });
-
-        event.track.onunmute = () => {
-          if (activePC === pc) videoEl.play().catch(() => {});
-        };
+        ensureRemotePlayback();
+        event.track.onunmute = ensureRemotePlayback;
+        videoEl.onloadedmetadata = ensureRemotePlayback;
+        videoEl.onloadeddata = ensureRemotePlayback;
 
         emptyState.style.display = 'none';
         stageTitle.innerText = 'Assistindo tela de ' + (data.fromNick || data.from);
         liveBadge.style.display = 'inline-block';
         btnDisconnect.style.display = 'flex';
 
-        if (event.track.kind === 'audio') {
-          unmuteNotice.style.display = 'block';
-        }
+        if (event.track.kind === 'audio') unmuteNotice.style.display = 'block';
       };
 
       pc.onicecandidate = (event) => {
@@ -1961,26 +1986,49 @@ app.get('/', (req, res) => {
         else wsSend(packet);
       };
 
+      const markViewerConnected = () => {
+        if (activePC !== pc) return;
+        viewerRecoveryAttempts = 0;
+        if (viewerRecoveryTimer) {
+          clearTimeout(viewerRecoveryTimer);
+          viewerRecoveryTimer = null;
+        }
+        if (viewerConnectTimer) {
+          clearTimeout(viewerConnectTimer);
+          viewerConnectTimer = null;
+        }
+        statusBadge.innerText = '⚡ Conectado • aguardando vídeo...';
+        startViewerStats(pc);
+      };
+
       pc.onconnectionstatechange = () => {
         if (activePC !== pc) return;
-
         const state = pc.connectionState;
-        if (state === 'connected') {
-          viewerRecoveryAttempts = 0;
-          if (viewerRecoveryTimer) {
-            clearTimeout(viewerRecoveryTimer);
-            viewerRecoveryTimer = null;
-          }
-          startViewerStats(pc);
-        } else if (state === 'connecting') {
-          statusBadge.innerText = '🔄 Conectando WebRTC...';
-        } else if (state === 'failed') {
-          statusBadge.innerText = '⚠️ Reconectando rota de internet...';
-          scheduleViewerRecovery(400);
+        if (state === 'connected') markViewerConnected();
+        else if (state === 'connecting') statusBadge.innerText = '🔄 Conectando WebRTC...';
+        else if (state === 'failed') {
+          statusBadge.innerText = '⚠️ Rota falhou • tentando outra...';
+          scheduleViewerRecovery(250);
         } else if (state === 'disconnected') {
           statusBadge.innerText = '🟡 Rede instável • tentando recuperar...';
-          scheduleViewerRecovery(2500);
+          scheduleViewerRecovery(1500);
         }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        if (activePC !== pc) return;
+        const state = pc.iceConnectionState;
+        if (state === 'connected' || state === 'completed') markViewerConnected();
+        else if (state === 'checking') statusBadge.innerText = '🔄 Testando rota P2P/TURN...';
+        else if (state === 'failed') {
+          statusBadge.innerText = '⚠️ ICE falhou • trocando rota...';
+          scheduleViewerRecovery(250);
+        }
+      };
+
+      pc.onicecandidateerror = (event) => {
+        if (activePC !== pc) return;
+        console.warn('ICE viewer error:', event.errorCode || '', event.errorText || '');
       };
 
       try {
@@ -1994,6 +2042,7 @@ app.get('/', (req, res) => {
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
+        const gatheredCompletely = await waitForIceGathering(pc, useRelayOnly ? 4500 : 2800);
 
         if (activePC !== pc) return;
 
@@ -2005,9 +2054,24 @@ app.get('/', (req, res) => {
         });
 
         viewerSignalReady = true;
-        while (viewerLocalCandidates.length) {
-          wsSend(viewerLocalCandidates.shift());
-        }
+        if (gatheredCompletely) viewerLocalCandidates.length = 0;
+        else while (viewerLocalCandidates.length) wsSend(viewerLocalCandidates.shift());
+
+        if (viewerConnectTimer) clearTimeout(viewerConnectTimer);
+        viewerConnectTimer = setTimeout(() => {
+          if (activePC !== pc) return;
+          const connected = pc.connectionState === 'connected' || ['connected', 'completed'].includes(pc.iceConnectionState);
+          if (connected) return;
+
+          if (!turnConfigured) {
+            statusBadge.innerText = '⚠️ P2P bloqueado nesta rede • configure TURN para acesso global';
+          } else {
+            statusBadge.innerText = useRelayOnly
+              ? '⚠️ TURN não conectou • tentando novamente...'
+              : '🔄 P2P bloqueado • tentando TURN...';
+          }
+          scheduleViewerRecovery(0);
+        }, useRelayOnly ? 15000 : 10000);
       } catch (err) {
         console.warn('Erro ao receber OFFER:', err.message);
         scheduleViewerRecovery(700);
@@ -2123,6 +2187,10 @@ app.get('/', (req, res) => {
         clearInterval(viewerStatsTimer);
         viewerStatsTimer = null;
       }
+      if (viewerConnectTimer) {
+        clearTimeout(viewerConnectTimer);
+        viewerConnectTimer = null;
+      }
 
       if (sendStop && oldBroadcaster) {
         wsSend({ type: 'STOP_WATCH', target: oldBroadcaster });
@@ -2132,6 +2200,8 @@ app.get('/', (req, res) => {
         try {
           activePC.ontrack = null;
           activePC.onicecandidate = null;
+          activePC.onicecandidateerror = null;
+          activePC.oniceconnectionstatechange = null;
           activePC.onconnectionstatechange = null;
           activePC.close();
         } catch (_) {}
