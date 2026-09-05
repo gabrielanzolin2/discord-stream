@@ -468,11 +468,16 @@ wss.on('connection', (ws) => {
           return;
         }
 
+        const codecMode = ['vp8', 'h264', 'auto'].includes(String(data.codecMode || '').toLowerCase())
+          ? String(data.codecMode).toLowerCase()
+          : 'vp8';
+
         safeSend(broadcaster.ws, {
           type: 'REQUEST_STREAM',
           from: userId,
           fromNick: userNick,
-          forceRelay: Boolean((data.forceRelay || FORCE_TURN_RELAY) && TURN_URLS.length)
+          forceRelay: Boolean((data.forceRelay || FORCE_TURN_RELAY) && TURN_URLS.length),
+          codecMode
         });
         return;
       }
@@ -501,7 +506,10 @@ wss.on('connection', (ws) => {
           sessionId,
           sdp: data.sdp,
           quality: data.quality && typeof data.quality === 'object' ? data.quality : undefined,
-          forceRelay: Boolean(data.forceRelay)
+          forceRelay: Boolean(data.forceRelay),
+          codecMode: ['vp8', 'h264', 'auto'].includes(String(data.codecMode || '').toLowerCase())
+            ? String(data.codecMode).toLowerCase()
+            : 'vp8'
         });
         return;
       }
@@ -520,6 +528,21 @@ wss.on('connection', (ws) => {
           fromNick: userNick,
           sessionId,
           sdp: data.sdp
+        });
+        return;
+      }
+
+      if (data.type === 'VIDEO_HEALTH') {
+        const targetId = normalizeId(data.target);
+        const targetClient = targetId ? activeUsers.get(targetId) : null;
+        if (!targetId || !targetClient || !sameRoom(currentUser, targetClient)) return;
+        if (viewerWatching.get(userId) !== targetId) return;
+        safeSend(targetClient.ws, {
+          type: 'VIDEO_HEALTH',
+          from: userId,
+          status: data.status === 'ready' ? 'ready' : 'black',
+          framesReceived: Math.max(0, Number(data.framesReceived || 0)),
+          framesDecoded: Math.max(0, Number(data.framesDecoded || 0))
         });
         return;
       }
@@ -899,8 +922,10 @@ app.get('/', (req, res) => {
       height: 1080,
       fps: 60,
       startTargetBitrate: 12_000_000,
+      safeStartBitrate: 4_000_000,
       maxBitrate: 18_000_000,
-      minBitrate: 3_000_000,
+      minBitrate: 2_000_000,
+      safeStartFps: 30,
       statsIntervalMs: 2500
     });
 
@@ -963,9 +988,11 @@ app.get('/', (req, res) => {
     let viewerLocalCandidates = [];
     let viewerSignalReady = false;
     let viewerStatsTimer = null;
+    let viewerFrameTimer = null;
     let viewerRecoveryTimer = null;
     let viewerConnectTimer = null;
     let viewerRecoveryAttempts = 0;
+    let viewerVideoHealthy = false;
     let desiredWatchId = null;
     let wsSessionToken = null;
 
@@ -1378,7 +1405,7 @@ app.get('/', (req, res) => {
         }
 
         if (data.type === 'REQUEST_STREAM' && isSharing && localStream) {
-          await initiateStreamToViewer(data.from, Boolean(data.forceRelay));
+          await initiateStreamToViewer(data.from, Boolean(data.forceRelay), 0, String(data.codecMode || 'vp8').toLowerCase());
           return;
         }
 
@@ -1389,6 +1416,23 @@ app.get('/', (req, res) => {
 
         if (data.type === 'ANSWER') {
           await handleSenderAnswer(data);
+          return;
+        }
+
+        if (data.type === 'VIDEO_HEALTH') {
+          const peer = senderPeers.get(data.from);
+          if (peer && !peer.closed) {
+            if (data.status === 'ready') {
+              if (!peer.videoReady) {
+                peer.videoReady = true;
+                peer.targetBitrate = peer.budgetCap || perViewerBitrateBudget();
+                await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate, false);
+              }
+            } else if (data.status === 'black') {
+              peer.codecMode = peer.codecMode === 'vp8' ? 'h264' : 'vp8';
+              scheduleSenderPeerRecovery(data.from, peer, 100);
+            }
+          }
           return;
         }
 
@@ -1453,41 +1497,38 @@ app.get('/', (req, res) => {
       });
     }
 
-    async function applyVideoSenderProfile(sender, targetBitrate) {
+    async function applyVideoSenderProfile(sender, targetBitrate, startupSafe = false) {
       if (!sender || !sender.track || sender.track.kind !== 'video') return;
-
-      const bitrate = Math.max(
-        QUALITY.minBitrate,
-        Math.min(QUALITY.maxBitrate, Number(targetBitrate || QUALITY.maxBitrate))
-      );
-
+      const bitrate = Math.max(QUALITY.minBitrate, Math.min(QUALITY.maxBitrate, Number(targetBitrate || QUALITY.safeStartBitrate)));
       try {
         const params = sender.getParameters();
-        if (!Array.isArray(params.encodings) || params.encodings.length === 0) {
-          params.encodings = [{}];
-        }
-
+        if (!Array.isArray(params.encodings) || params.encodings.length === 0) params.encodings = [{}];
         params.encodings[0].maxBitrate = bitrate;
-        params.encodings[0].maxFramerate = QUALITY.fps;
-        params.encodings[0].scaleResolutionDownBy = 1;
-        params.degradationPreference = 'maintain-resolution';
-
+        params.encodings[0].maxFramerate = startupSafe ? QUALITY.safeStartFps : QUALITY.fps;
+        params.encodings[0].scaleResolutionDownBy = startupSafe ? 1.5 : 1;
         await sender.setParameters(params);
-        return;
       } catch (err) {
-        console.warn('Perfil RTP completo não suportado; tentando modo compatível:', err.message);
+        console.warn('Ajuste RTP não suportado; usando controle nativo do navegador:', err.message);
       }
+    }
 
+    function preferVideoCodec(pc, sender, codecMode = 'vp8') {
+      if (!pc || !sender || codecMode === 'auto') return;
       try {
-        const fallback = sender.getParameters();
-        if (!Array.isArray(fallback.encodings) || fallback.encodings.length === 0) {
-          fallback.encodings = [{}];
+        const transceiver = pc.getTransceivers().find((t) => t.sender === sender);
+        if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
+        if (!window.RTCRtpSender || typeof RTCRtpSender.getCapabilities !== 'function') return;
+        const caps = RTCRtpSender.getCapabilities('video');
+        if (!caps || !Array.isArray(caps.codecs)) return;
+        const wanted = codecMode === 'h264' ? 'video/H264' : 'video/VP8';
+        const preferred = []; const rest = [];
+        for (const codec of caps.codecs) {
+          if (String(codec.mimeType || '').toLowerCase() === wanted.toLowerCase()) preferred.push(codec);
+          else rest.push(codec);
         }
-        fallback.encodings[0].maxBitrate = bitrate;
-        fallback.encodings[0].maxFramerate = QUALITY.fps;
-        await sender.setParameters(fallback);
+        if (preferred.length) transceiver.setCodecPreferences([...preferred, ...rest]);
       } catch (err) {
-        console.warn('Ajuste RTP de bitrate/FPS não suportado por este navegador:', err.message);
+        console.warn('Preferência de codec indisponível; mantendo negociação nativa:', err.message);
       }
     }
 
@@ -1507,9 +1548,8 @@ app.get('/', (req, res) => {
       senderPeers.forEach((peer) => {
         if (!peer || peer.closed) return;
         peer.budgetCap = budgetCap;
-        // Ao entrar/sair espectadores, sobe ou desce rapidamente para o novo teto seguro.
-        peer.targetBitrate = budgetCap;
-        tasks.push(applyVideoSenderProfile(peer.videoSender, peer.targetBitrate));
+        peer.targetBitrate = peer.videoReady ? budgetCap : Math.min(QUALITY.safeStartBitrate, budgetCap);
+        tasks.push(applyVideoSenderProfile(peer.videoSender, peer.targetBitrate, !peer.videoReady));
       });
 
       await Promise.allSettled(tasks);
@@ -1519,7 +1559,7 @@ app.get('/', (req, res) => {
       if (!videoTrack) return;
 
       if ('contentHint' in videoTrack) {
-        videoTrack.contentHint = 'motion';
+        videoTrack.contentHint = 'detail';
       }
 
       try {
@@ -1626,7 +1666,7 @@ app.get('/', (req, res) => {
       wsSend({ type: 'LIVE_STATE_CHANGE', isLive: false });
     }
 
-    async function initiateStreamToViewer(viewerId, forceRelay = false, recoveryAttempts = 0) {
+    async function initiateStreamToViewer(viewerId, forceRelay = false, recoveryAttempts = 0, codecMode = 'vp8') {
       if (!isSharing || !localStream || !viewerId) return;
 
       await refreshRtcConfig(false);
@@ -1644,6 +1684,11 @@ app.get('/', (req, res) => {
         localCandidates: [],
         signalReady: false,
         videoSender: null,
+        videoTrackClone: null,
+        mediaStreamClone: null,
+        codecMode: ['vp8', 'h264', 'auto'].includes(codecMode) ? codecMode : 'vp8',
+        videoReady: false,
+        startupSamples: 0,
         statsTimer: null,
         reconnectTimer: null,
         connectTimer: null,
@@ -1661,16 +1706,18 @@ app.get('/', (req, res) => {
 
       senderPeers.set(viewerId, peer);
 
-      const videoTrack = localStream.getVideoTracks()[0];
+      const sourceVideoTrack = localStream.getVideoTracks()[0];
       const audioTracks = localStream.getAudioTracks();
 
-      if (videoTrack) {
-        // addTrack() é o caminho mais interoperável para screen sharing entre
-        // navegadores/dispositivos diferentes. O bitrate é aplicado depois.
-        peer.videoSender = pc.addTrack(videoTrack, localStream);
+      if (sourceVideoTrack) {
+        peer.videoTrackClone = sourceVideoTrack.clone();
+        if ('contentHint' in peer.videoTrackClone) peer.videoTrackClone.contentHint = 'detail';
+        peer.mediaStreamClone = new MediaStream([peer.videoTrackClone, ...audioTracks]);
+        peer.videoSender = pc.addTrack(peer.videoTrackClone, peer.mediaStreamClone);
+        preferVideoCodec(pc, peer.videoSender, peer.codecMode);
       }
 
-      audioTracks.forEach((track) => pc.addTrack(track, localStream));
+      audioTracks.forEach((track) => pc.addTrack(track, peer.mediaStreamClone || localStream));
 
       pc.onicecandidate = (event) => {
         if (!event.candidate || peer.closed) return;
@@ -1719,8 +1766,8 @@ app.get('/', (req, res) => {
         console.warn('ICE sender error:', event.errorCode || '', event.errorText || '');
       };
 
-      await rebalanceSenderBitrates();
-      await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate);
+      peer.targetBitrate = Math.min(QUALITY.safeStartBitrate, peer.budgetCap);
+      await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate, true);
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -1742,7 +1789,8 @@ app.get('/', (req, res) => {
           fps: QUALITY.fps,
           maxBitrate: peer.targetBitrate
         },
-        forceRelay: peer.forceRelay
+        forceRelay: peer.forceRelay,
+        codecMode: peer.codecMode
       });
 
       peer.signalReady = true;
@@ -1769,8 +1817,9 @@ app.get('/', (req, res) => {
         peer.reconnectTimer = null;
         if (peer.closed || senderPeers.get(viewerId) !== peer || !isSharing) return;
         const nextAttempts = Number(peer.recoveryAttempts || 0) + 1;
-        const useRelay = peer.forceRelay || (turnConfigured && nextAttempts >= 2);
-        initiateStreamToViewer(viewerId, useRelay, nextAttempts).catch(console.warn);
+        const useRelay = peer.forceRelay || (turnConfigured && nextAttempts >= 3);
+        const nextCodec = peer.codecMode || (nextAttempts >= 2 ? 'h264' : 'vp8');
+        initiateStreamToViewer(viewerId, useRelay, nextAttempts, nextCodec).catch(console.warn);
       }, delay);
     }
 
@@ -1788,7 +1837,7 @@ app.get('/', (req, res) => {
           await peer.pc.addIceCandidate(candidate).catch(console.warn);
         }
 
-        await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate);
+        await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate, true);
         startSenderQualityManager(data.from, peer);
       } catch (err) {
         console.warn('Erro ao aplicar ANSWER:', err.message);
@@ -1804,6 +1853,8 @@ app.get('/', (req, res) => {
       if (peer.statsTimer) clearInterval(peer.statsTimer);
       if (peer.reconnectTimer) clearTimeout(peer.reconnectTimer);
       if (peer.connectTimer) clearTimeout(peer.connectTimer);
+
+      try { if (peer.videoTrackClone) peer.videoTrackClone.stop(); } catch (_) {}
 
       try {
         peer.pc.onicecandidate = null;
@@ -1856,6 +1907,13 @@ app.get('/', (req, res) => {
 
           peer.currentMbps = currentMbps;
           peer.budgetCap = perViewerBitrateBudget();
+
+          const framesEncoded = Number(outbound.framesEncoded || 0);
+          if (framesEncoded > 0) peer.startupSamples += 1;
+          if (!peer.videoReady) {
+            peer.targetBitrate = Math.min(QUALITY.safeStartBitrate, peer.budgetCap);
+            return;
+          }
 
           const available = Number(pair && pair.availableOutgoingBitrate || 0);
           if (available > 0) {
@@ -1926,6 +1984,7 @@ app.get('/', (req, res) => {
       activePCQueue = [];
       viewerLocalCandidates = [];
       viewerSignalReady = false;
+      viewerVideoHealthy = false;
 
       const useRelayOnly = Boolean((data.forceRelay || FORCE_TURN_RELAY_POLICY) && turnConfigured);
       const pc = new RTCPeerConnection(buildPeerRtcConfig(useRelayOnly));
@@ -1997,8 +2056,9 @@ app.get('/', (req, res) => {
           clearTimeout(viewerConnectTimer);
           viewerConnectTimer = null;
         }
-        statusBadge.innerText = '⚡ Conectado • aguardando vídeo...';
+        statusBadge.innerText = '⚡ Conectado • aguardando primeiro quadro...';
         startViewerStats(pc);
+        startViewerFrameWatchdog(pc, data.from);
       };
 
       pc.onconnectionstatechange = () => {
@@ -2115,10 +2175,44 @@ app.get('/', (req, res) => {
       viewerRecoveryTimer = setTimeout(() => {
         viewerRecoveryTimer = null;
         const target = desiredWatchId;
-        const useRelay = Boolean(turnConfigured && viewerRecoveryAttempts >= 2);
+        const useRelay = Boolean(turnConfigured && viewerRecoveryAttempts >= 3);
+        const codecMode = viewerRecoveryAttempts >= 2 ? 'h264' : 'vp8';
         closeViewerConnection(false);
-        if (target) requestWatch(target, true, useRelay);
+        if (target) requestWatch(target, true, useRelay, codecMode);
       }, backoff);
+    }
+
+    function startViewerFrameWatchdog(pc, broadcasterId) {
+      if (viewerFrameTimer) clearInterval(viewerFrameTimer);
+      const startedAt = Date.now();
+      let blackSamples = 0;
+      viewerFrameTimer = setInterval(async () => {
+        if (activePC !== pc || viewerVideoHealthy || pc.connectionState !== 'connected') return;
+        try {
+          const report = await pc.getStats();
+          let inbound = null;
+          report.forEach((stat) => { if (stat.type === 'inbound-rtp' && stat.kind === 'video' && !stat.isRemote) inbound = stat; });
+          if (!inbound) {
+            if (Date.now() - startedAt > 7000) { statusBadge.innerText = '⚠️ Conectou, mas nenhum vídeo chegou • renegociando...'; scheduleViewerRecovery(150); }
+            return;
+          }
+          const received = Number(inbound.framesReceived || 0);
+          const decoded = Number(inbound.framesDecoded || 0);
+          const bytes = Number(inbound.bytesReceived || 0);
+          const elementHasFrame = videoEl.videoWidth > 0 && videoEl.videoHeight > 0 && videoEl.readyState >= 2;
+          if (decoded > 0 || (received > 0 && elementHasFrame)) {
+            viewerVideoHealthy = true;
+            wsSend({ type: 'VIDEO_HEALTH', target: broadcasterId, status: 'ready', framesReceived: received, framesDecoded: decoded });
+            clearInterval(viewerFrameTimer); viewerFrameTimer = null; return;
+          }
+          if (bytes > 0 || received > 0) blackSamples += 1;
+          if (blackSamples >= 3 || Date.now() - startedAt > 8000) {
+            wsSend({ type: 'VIDEO_HEALTH', target: broadcasterId, status: 'black', framesReceived: received, framesDecoded: decoded });
+            statusBadge.innerText = '⚠️ Vídeo chegou sem decodificar • trocando codec...';
+            scheduleViewerRecovery(150); clearInterval(viewerFrameTimer); viewerFrameTimer = null;
+          }
+        } catch (_) {}
+      }, 1000);
     }
 
     function startViewerStats(pc) {
@@ -2148,6 +2242,12 @@ app.get('/', (req, res) => {
           }
 
           if (!inbound) return;
+
+          const decodedFrames = Number(inbound.framesDecoded || 0);
+          if (!viewerVideoHealthy && decodedFrames > 0) {
+            viewerVideoHealthy = true;
+            wsSend({ type: 'VIDEO_HEALTH', target: activeBroadcasterId, status: 'ready', framesReceived: Number(inbound.framesReceived || 0), framesDecoded: decodedFrames });
+          }
 
           const now = performance.now();
           let mbps = null;
@@ -2187,6 +2287,11 @@ app.get('/', (req, res) => {
         clearInterval(viewerStatsTimer);
         viewerStatsTimer = null;
       }
+      if (viewerFrameTimer) {
+        clearInterval(viewerFrameTimer);
+        viewerFrameTimer = null;
+      }
+      viewerVideoHealthy = false;
       if (viewerConnectTimer) {
         clearTimeout(viewerConnectTimer);
         viewerConnectTimer = null;
@@ -2371,7 +2476,7 @@ app.get('/', (req, res) => {
       });
     }
 
-    function requestWatch(friendId, fromReconnect = false, forceRelay = false) {
+    function requestWatch(friendId, fromReconnect = false, forceRelay = false, codecMode = 'vp8') {
       friendId = String(friendId || '').trim().toLowerCase();
       if (!friendId || friendId === myId || isSharing) return;
 
@@ -2394,7 +2499,8 @@ app.get('/', (req, res) => {
         ? '🔄 Reconectando pela rota TURN segura...'
         : '🔄 Solicitando transmissão...';
 
-      if (!wsSend({ type: 'REQUEST_STREAM', target: friendId, forceRelay: relayRequested })) {
+      const requestedCodec = ['vp8', 'h264', 'auto'].includes(codecMode) ? codecMode : 'vp8';
+      if (!wsSend({ type: 'REQUEST_STREAM', target: friendId, forceRelay: relayRequested, codecMode: requestedCodec })) {
         scheduleReconnect();
       }
     }
