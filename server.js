@@ -7,14 +7,16 @@ const app = express();
 const server = http.createServer(app);
 
 const PORT = Number(process.env.PORT || 3000);
-const APP_VERSION = process.env.APP_VERSION || (process.env.RENDER_GIT_COMMIT ? process.env.RENDER_GIT_COMMIT.slice(0, 12) : '2026.09.04-ultra-2');
+const APP_VERSION = process.env.APP_VERSION || (process.env.RENDER_GIT_COMMIT ? process.env.RENDER_GIT_COMMIT.slice(0, 12) : '2026.09.06-stream-4');
 const DEFAULT_ROOM = 'sala-principal';
-const MAX_VIEWERS_PER_STREAM = Math.max(2, Math.min(50, Number(process.env.MAX_VIEWERS_PER_STREAM || 8)));
 const STREAM_UPLOAD_BUDGET_BPS = Math.max(8_000_000, Number(process.env.STREAM_UPLOAD_BUDGET_BPS || 36_000_000));
+// Reserva 20% para overhead e 96 kbps de áudio por observador.
+const MAX_VIEWERS_PER_STREAM = Math.max(2, Math.min(50, Math.floor(STREAM_UPLOAD_BUDGET_BPS * 0.8 / 246_000), Number(process.env.MAX_VIEWERS_PER_STREAM || 8)));
 const WS_RATE_WINDOW_MS = 10_000;
 const WS_RATE_MAX_MESSAGES = Math.max(100, Number(process.env.WS_RATE_MAX_MESSAGES || 350));
 const RTC_CONFIG_RATE_LIMIT = Math.max(10, Number(process.env.RTC_CONFIG_RATE_LIMIT || 60));
 const FORCE_TURN_RELAY = String(process.env.FORCE_TURN_RELAY || '').toLowerCase() === 'true';
+const DISCONNECT_GRACE_MS = 30_000;
 
 const TURN_URLS = String(process.env.TURN_URLS || '')
   .split(',')
@@ -332,6 +334,7 @@ wss.on('connection', (ws) => {
       }
 
       if (data.type === 'JOIN') {
+        if (userId) return; // Uma identidade por socket.
         const nextUserId = normalizeId(data.userId);
         if (!nextUserId) {
           safeSend(ws, { type: 'ERROR', code: 'INVALID_USER_ID' });
@@ -342,6 +345,10 @@ wss.on('connection', (ws) => {
         userNick = normalizeNick(data.nick);
         userRoom = normalizeRoom(data.room);
         const isLive = Boolean(data.isLive);
+        const desiredBroadcaster = normalizeId(data.watching);
+        if (viewerWatching.has(userId) && (isLive || viewerWatching.get(userId) !== desiredBroadcaster)) {
+          removeViewerFromStream(userId, true);
+        }
 
         const graceTimer = disconnectGraceTimers.get(userId);
         if (graceTimer) {
@@ -350,6 +357,11 @@ wss.on('connection', (ws) => {
         }
 
         const previous = activeUsers.get(userId);
+        if (previous && previous.room !== userRoom) {
+          rooms.get(previous.room)?.delete(userId);
+          removeViewerFromStream(userId, true);
+          endStreamAudience(userId, 'room_changed');
+        }
         if (previous && previous.ws !== ws) {
           safeSend(previous.ws, { type: 'SESSION_REPLACED' });
           try { previous.ws.close(4001, 'Session replaced'); } catch (_) {}
@@ -392,7 +404,14 @@ wss.on('connection', (ws) => {
         });
         safeSend(ws, { type: 'SYNC_LIVE_USERS', liveUsers });
 
-        if (isLive) sendAudienceSnapshot(userId);
+        if (isLive) {
+          sendAudienceSnapshot(userId);
+          for (const viewerId of (streamViewers.get(userId) || new Map()).keys()) {
+            safeSend(activeUsers.get(viewerId)?.ws, { type: 'STREAM_RETRY', from: userId });
+          }
+        } else {
+          endStreamAudience(userId, 'broadcaster_stopped');
+        }
         const watchedBroadcaster = viewerWatching.get(userId);
         if (watchedBroadcaster) sendAudienceSnapshot(watchedBroadcaster);
         return;
@@ -451,13 +470,22 @@ wss.on('connection', (ws) => {
 
       if (data.type === 'REQUEST_STREAM') {
         const targetId = normalizeId(data.target);
-        if (!targetId || targetId === userId) return;
+        const requestId = normalizeSessionId(data.requestId);
+        if (!targetId || targetId === userId || !requestId) return;
 
         const broadcaster = activeUsers.get(targetId);
         if (!broadcaster || !broadcaster.isLive || !sameRoom(currentUser, broadcaster)) {
           safeSend(ws, { type: 'STREAM_NOT_FOUND', targetId });
           return;
         }
+
+        if (broadcaster.ws.readyState !== WebSocket.OPEN) {
+          safeSend(ws, { type: 'STREAM_WAIT', targetId });
+          return;
+        }
+
+        const existing = streamViewers.get(targetId)?.get(userId);
+        if (existing?.requestId === requestId) return;
 
         if (!addViewerToStream(userId, targetId)) {
           safeSend(ws, {
@@ -468,6 +496,8 @@ wss.on('connection', (ws) => {
           return;
         }
 
+        Object.assign(getAudienceMap(targetId).get(userId), { requestId, sessionId: null });
+
         const codecMode = ['vp8', 'h264', 'auto'].includes(String(data.codecMode || '').toLowerCase())
           ? String(data.codecMode).toLowerCase()
           : 'vp8';
@@ -476,6 +506,7 @@ wss.on('connection', (ws) => {
           type: 'REQUEST_STREAM',
           from: userId,
           fromNick: userNick,
+          requestId,
           forceRelay: Boolean((data.forceRelay || FORCE_TURN_RELAY) && TURN_URLS.length),
           codecMode
         });
@@ -498,12 +529,16 @@ wss.on('connection', (ws) => {
         if (!targetId || !targetClient || !sameRoom(currentUser, targetClient)) return;
         if (viewerWatching.get(targetId) !== userId) return;
         if (!sessionId || !validDescription(data.sdp, 'offer')) return;
+        const watch = streamViewers.get(userId)?.get(targetId);
+        if (!watch || watch.requestId !== data.requestId) return;
+        watch.sessionId = sessionId;
 
         safeSend(targetClient.ws, {
           type: 'OFFER',
           from: userId,
           fromNick: userNick,
           sessionId,
+          requestId: watch.requestId,
           sdp: data.sdp,
           quality: data.quality && typeof data.quality === 'object' ? data.quality : undefined,
           forceRelay: Boolean(data.forceRelay),
@@ -521,6 +556,7 @@ wss.on('connection', (ws) => {
         if (!targetId || !targetClient || !sameRoom(currentUser, targetClient)) return;
         if (viewerWatching.get(userId) !== targetId) return;
         if (!sessionId || !validDescription(data.sdp, 'answer')) return;
+        if (streamViewers.get(targetId)?.get(userId)?.sessionId !== sessionId) return;
 
         safeSend(targetClient.ws, {
           type: 'ANSWER',
@@ -537,9 +573,11 @@ wss.on('connection', (ws) => {
         const targetClient = targetId ? activeUsers.get(targetId) : null;
         if (!targetId || !targetClient || !sameRoom(currentUser, targetClient)) return;
         if (viewerWatching.get(userId) !== targetId) return;
+        if (streamViewers.get(targetId)?.get(userId)?.sessionId !== data.sessionId) return;
         safeSend(targetClient.ws, {
           type: 'VIDEO_HEALTH',
           from: userId,
+          sessionId: data.sessionId,
           status: data.status === 'ready' ? 'ready' : 'black',
           framesReceived: Math.max(0, Number(data.framesReceived || 0)),
           framesDecoded: Math.max(0, Number(data.framesDecoded || 0))
@@ -554,6 +592,9 @@ wss.on('connection', (ws) => {
         if (!targetId || !targetClient || !sameRoom(currentUser, targetClient)) return;
         if (!streamPeerAuthorized(userId, targetId)) return;
         if (!sessionId || !validCandidate(data.candidate)) return;
+        const broadcasterId = viewerWatching.get(userId) === targetId ? targetId : userId;
+        const viewerId = broadcasterId === userId ? targetId : userId;
+        if (streamViewers.get(broadcasterId)?.get(viewerId)?.sessionId !== sessionId) return;
 
         safeSend(targetClient.ws, {
           type: 'CANDIDATE',
@@ -563,6 +604,15 @@ wss.on('connection', (ws) => {
           candidate: data.candidate
         });
         return;
+      }
+
+      if (data.type === 'STREAM_RETRY') {
+        const targetId = normalizeId(data.target);
+        const watch = streamViewers.get(userId)?.get(targetId);
+        if (!watch || watch.sessionId !== data.sessionId) return;
+        safeSend(activeUsers.get(targetId)?.ws, {
+          type: 'STREAM_RETRY', from: userId, sessionId: data.sessionId
+        });
       }
     } catch (err) {
       console.error('Erro WebSocket:', err.message);
@@ -580,8 +630,6 @@ wss.on('connection', (ws) => {
     const current = activeUsers.get(userId);
     if (!current || current.ws !== ws) return;
 
-    activeUsers.delete(userId);
-
     const roomClients = rooms.get(userRoom);
     if (roomClients?.get(userId) === ws) {
       roomClients.delete(userId);
@@ -590,7 +638,8 @@ wss.on('connection', (ws) => {
 
     const cleanupTimer = setTimeout(() => {
       disconnectGraceTimers.delete(userId);
-      if (activeUsers.has(userId)) return;
+      if (activeUsers.get(userId)?.ws !== ws) return;
+      activeUsers.delete(userId);
 
       if (viewerWatching.has(userId)) removeViewerFromStream(userId, true);
       if (streamViewers.has(userId)) endStreamAudience(userId, 'broadcaster_offline');
@@ -602,7 +651,7 @@ wss.on('connection', (ws) => {
         nick: userNick,
         isLive: false
       });
-    }, 5000);
+    }, DISCONNECT_GRACE_MS);
 
     disconnectGraceTimers.set(userId, cleanupTimer);
   });
@@ -645,7 +694,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     appVersion: APP_VERSION,
-    usersOnline: activeUsers.size,
+    usersOnline: Array.from(activeUsers.values()).filter((u) => u.ws.readyState === WebSocket.OPEN).length,
     activeStreams: Array.from(activeUsers.values()).filter((u) => u.isLive).length,
     activeViewers: viewerWatching.size,
     maxViewersPerStream: MAX_VIEWERS_PER_STREAM,
@@ -805,13 +854,18 @@ app.get('/', (req, res) => {
     .empty-state svg { width: 72px; height: 72px; fill: #4e5058; margin-bottom: 12px; }
 
     /* DOCK FLUTUANTE */
-    .control-dock { position: absolute; bottom: 24px; display: flex; align-items: center; gap: 10px; background: rgba(20,20,22,0.92); padding: 10px 20px; border-radius: 30px; backdrop-filter: blur(10px); z-index: 50; }
+    .control-dock { position: absolute; bottom: 24px; max-width: calc(100% - 24px); display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 10px; background: rgba(20,20,22,0.92); padding: 10px 20px; border-radius: 30px; backdrop-filter: blur(10px); z-index: 50; }
     .btn-dock { background: #313338; color: #fff; border: none; padding: 10px 18px; border-radius: 20px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 13px; display: flex; align-items: center; gap: 6px; }
     .btn-dock:hover { background: #3f4147; }
     .btn-dock.primary { background: var(--discord-blurple); }
     .btn-dock.primary:hover { background: var(--discord-blurple-hover); }
     .btn-dock.danger { background: var(--discord-red); }
     .btn-dock.copy { background: var(--discord-green); }
+    .btn-dock:disabled { opacity: .55; cursor: wait; }
+    .call-mode { display: flex; align-items: center; gap: 6px; font-size: 12px; white-space: nowrap; }
+    .audio-status { position: absolute; left: 16px; top: 16px; max-width: calc(100% - 340px); padding: 8px 12px; border-radius: 8px; background: rgba(20,20,22,.9); font-size: 12px; line-height: 1.5; pointer-events: none; }
+    .audio-status:empty { display: none; }
+    @media (max-width: 850px) { .guild-bar { display: none; } .sidebar { width: 210px; } .top-bar { height: auto; min-height: 48px; flex-wrap: wrap; gap: 6px; padding: 8px; } .stream-info { flex-wrap: wrap; } .audio-status { top: auto; bottom: 150px; max-width: calc(100% - 32px); } }
 
     #unmuteNotice { position: absolute; top: 20px; background: rgba(0,0,0,0.85); border: 1px solid #f0b232; color: #f0b232; padding: 8px 18px; border-radius: 20px; font-weight: bold; font-size: 12px; cursor: pointer; display: none; z-index: 100; }
 
@@ -882,7 +936,8 @@ app.get('/', (req, res) => {
     </div>
 
     <div class="video-viewport">
-      <div id="unmuteNotice" onclick="unmute()">🔊 Clique aqui para ativar o áudio</div>
+      <button type="button" id="unmuteNotice" onclick="unmute()">🔊 Ativar áudio da transmissão</button>
+      <div id="audioStatus" class="audio-status" role="status" aria-live="polite"></div>
       <video id="remoteVideo" autoplay playsinline></video>
 
       <div class="audience-panel" id="audiencePanel">
@@ -897,13 +952,16 @@ app.get('/', (req, res) => {
       <div class="empty-state" id="emptyState">
         <svg viewBox="0 0 24 24"><path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 1.99-.9 1.99-2L23 5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z"/></svg>
         <h3 style="color: #fff;">Pronto para transmitir</h3>
-        <p style="margin-top: 6px;">Transmita sua tela em 60 FPS sem tela preta!</p>
+        <p style="margin-top: 6px;">Em call, compartilhe a aba do conteúdo com áudio. Mantenha a call em outra aba ou aplicativo.</p>
       </div>
 
       <!-- DOCK FLUTUANTE -->
       <div class="control-dock">
+        <label class="call-mode" title="Evita reenviar o microfone e o áudio geral do computador. Compartilhe a aba do conteúdo, separada da call."><input type="checkbox" id="callMode" checked onchange="updateAudioUi()">Já estou em uma call</label>
         <button class="btn-dock primary" id="btnShare" onclick="toggleShare()">Transmitir Tela</button>
         <button class="btn-dock copy" id="btnCopyLink" style="display: none;" onclick="copyStreamLink()">🔗 Copiar Link da Live</button>
+        <button class="btn-dock" id="btnMic" style="display: none;" onclick="toggleMicrophone()" aria-pressed="false">Ativar microfone</button>
+        <button class="btn-dock" id="btnAudio" style="display: none;" onclick="toggleViewerAudio()" aria-pressed="false">Ativar áudio</button>
         <button class="btn-dock danger" id="btnDisconnect" style="display: none;" onclick="disconnectStream()">Desconectar</button>
         <button class="btn-dock" onclick="toggleFullscreen()">Tela Cheia</button>
       </div>
@@ -924,7 +982,7 @@ app.get('/', (req, res) => {
       startTargetBitrate: 12_000_000,
       safeStartBitrate: 4_000_000,
       maxBitrate: 18_000_000,
-      minBitrate: 2_000_000,
+      minBitrate: 150_000,
       safeStartFps: 30,
       statsIntervalMs: 2500
     });
@@ -936,6 +994,12 @@ app.get('/', (req, res) => {
       localStorage.setItem('dc_user_id', myId);
     }
     myId = myId.trim().toLowerCase();
+    const ownStreamBroadcasterId = myId;
+    // Abrir o próprio link em outra aba não deve expulsar o transmissor.
+    const ownStreamPreview = new URLSearchParams(location.search).get('watch') === myId;
+    if (ownStreamPreview) {
+      myId = 'dc-view-' + createSessionId();
+    }
 
     let myNick = localStorage.getItem('dc_user_nick') || 'Gamer#' + myId.slice(-4);
     let friends = [];
@@ -961,6 +1025,10 @@ app.get('/', (req, res) => {
     const btnCopyLink = document.getElementById('btnCopyLink');
     const btnDisconnect = document.getElementById('btnDisconnect');
     const unmuteNotice = document.getElementById('unmuteNotice');
+    const audioStatus = document.getElementById('audioStatus');
+    const btnMic = document.getElementById('btnMic');
+    const callMode = document.getElementById('callMode');
+    const btnAudio = document.getElementById('btnAudio');
     const statusBadge = document.getElementById('statusBadge');
     const connStatusText = document.getElementById('connStatusText');
     const audienceBadge = document.getElementById('audienceBadge');
@@ -972,6 +1040,19 @@ app.get('/', (req, res) => {
     // --- ESTADO DE TRANSMISSÃO ---
     let localStream = null;
     let isSharing = false;
+    let startingShare = false;
+    let captureStream = null;
+    let microphoneStream = null;
+    let audioContext = null;
+    let audioMix = null;
+    let systemAudioSource = null;
+    let microphoneSource = null;
+    let audioOperation = 0;
+    let streamCallMode = true;
+    let captureAudioBlocked = false;
+    let viewerWantsAudio = !ownStreamPreview;
+    const senderRequests = new Map();
+    const senderProfileUpdates = new WeakMap();
     let currentAudience = [];
     let currentAudienceMax = MAX_VIEWERS;
     let currentAudienceBroadcasterId = null;
@@ -994,6 +1075,9 @@ app.get('/', (req, res) => {
     let viewerRecoveryAttempts = 0;
     let viewerVideoHealthy = false;
     let desiredWatchId = null;
+    let watchRequestId = null;
+    let offerRevision = 0;
+    const pendingViewerCandidates = new Map();
     let wsSessionToken = null;
 
     // --- ICE / STUN / TURN DINÂMICO ---
@@ -1020,14 +1104,14 @@ app.get('/', (req, res) => {
         iceTransportPolicy: forceRelay && turnConfigured ? 'relay' : 'all',
         bundlePolicy: 'max-bundle',
         rtcpMuxPolicy: 'require',
-        iceCandidatePoolSize: forceRelay ? 2 : 8
+        iceCandidatePoolSize: 0
       };
     }
 
     async function refreshRtcConfig(force) {
       const now = Date.now();
       const age = now - rtcConfigLoadedAt;
-      const credentialsStillFresh = !rtcConfigExpiresAt || now < rtcConfigExpiresAt - 5 * 60 * 1000;
+      const credentialsStillFresh = !rtcConfigExpiresAt || now < rtcConfigExpiresAt - 60 * 1000;
       if (!force && rtcConfigLoadedAt && age < 30 * 60 * 1000 && credentialsStillFresh) return rtcConfig;
       if (rtcConfigPromise) return rtcConfigPromise;
 
@@ -1035,20 +1119,22 @@ app.get('/', (req, res) => {
       if (!wsSessionToken) return rtcConfig;
 
       rtcConfigPromise = (async () => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        const sessionToken = wsSessionToken;
         try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 5000);
           const res = await fetch('/api/rtc-config?userId=' + encodeURIComponent(myId), {
             cache: 'no-store',
             signal: controller.signal,
             headers: {
-              'X-Session-Token': wsSessionToken
+              'X-Session-Token': sessionToken
             }
           });
           clearTimeout(timeout);
 
           if (!res.ok) throw new Error('HTTP ' + res.status);
           const data = await res.json();
+          if (sessionToken !== wsSessionToken) return rtcConfig;
 
           if (Array.isArray(data.iceServers) && data.iceServers.length) {
             rtcConfig = {
@@ -1071,6 +1157,7 @@ app.get('/', (req, res) => {
         } catch (err) {
           console.warn('Falha ao carregar RTC config; usando configuração ICE já disponível:', err.message);
         } finally {
+          clearTimeout(timeout);
           rtcConfigPromise = null;
         }
         return rtcConfig;
@@ -1134,7 +1221,13 @@ app.get('/', (req, res) => {
       currentAudienceMax = Number(data.maxViewers || MAX_VIEWERS);
       renderAudience();
 
-      if (isSharing) rebalanceSenderBitrates().catch(() => {});
+      if (isSharing) {
+        const audienceIds = new Set(currentAudience.map((viewer) => viewer.userId));
+        for (const viewerId of senderRequests.keys()) {
+          if (!audienceIds.has(viewerId)) { senderRequests.delete(viewerId); closeSenderPeer(viewerId); }
+        }
+        rebalanceSenderBitrates().catch(() => {});
+      }
     }
 
     function clearAudienceUi() {
@@ -1199,6 +1292,8 @@ app.get('/', (req, res) => {
     let reconnectTimer = null;
     let reconnectAttempt = 0;
     let allowReconnect = true;
+    let lastSocketMessageAt = 0;
+    let socketOpenedAt = 0;
 
     function setConnectionUi(state) {
       if (state === 'online') {
@@ -1215,6 +1310,8 @@ app.get('/', (req, res) => {
 
     function wsSend(payload) {
       if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      if (payload.type !== 'JOIN' && payload.type !== 'PING' && !wsSessionToken) return false;
+      if (ws.bufferedAmount > 512 * 1024) return false;
       try {
         ws.send(JSON.stringify(payload));
         return true;
@@ -1244,9 +1341,12 @@ app.get('/', (req, res) => {
       setConnectionUi('connecting');
       const socket = new WebSocket(protocol + '//' + location.host);
       ws = socket;
+      socketOpenedAt = Date.now();
+      lastSocketMessageAt = Date.now();
 
       socket.onopen = () => {
         if (ws !== socket) return;
+        lastSocketMessageAt = Date.now();
         reconnectAttempt = 0;
         setConnectionUi('online');
 
@@ -1255,12 +1355,14 @@ app.get('/', (req, res) => {
           userId: myId,
           nick: myNick,
           room: ROOM_NAME,
-          isLive: isSharing
+          isLive: isSharing,
+          watching: desiredWatchId
         });
       };
 
       socket.onmessage = async (event) => {
         if (ws !== socket) return;
+        lastSocketMessageAt = Date.now();
 
         let data;
         try {
@@ -1285,16 +1387,13 @@ app.get('/', (req, res) => {
           rtcConfigLoadedAt = 0;
           rtcConfigExpiresAt = 0;
           await refreshRtcConfig(true);
+          if (ws !== socket || socket.readyState !== WebSocket.OPEN) return;
 
           if (isSharing) {
             wsSend({ type: 'LIVE_STATE_CHANGE', isLive: true });
           }
 
-          const viewerNeedsResync =
-            !activePC ||
-            ['failed', 'closed'].includes(activePC.connectionState);
-
-          if (desiredWatchId && desiredWatchId !== myId && !isSharing && viewerNeedsResync) {
+          if (desiredWatchId && desiredWatchId !== myId && !isSharing) {
             setTimeout(() => {
               if (ws === socket && socket.readyState === WebSocket.OPEN) {
                 requestWatch(desiredWatchId, true, false);
@@ -1362,10 +1461,8 @@ app.get('/', (req, res) => {
 
         if (data.type === 'STREAM_FULL') {
           if (desiredWatchId === String(data.targetId || '').toLowerCase()) {
+            disconnectStream();
             statusBadge.innerText = '⚠️ Live cheia • limite de ' + Number(data.maxViewers || MAX_VIEWERS) + ' espectadores';
-            desiredWatchId = null;
-            closeViewerConnection(false);
-            clearAudienceUi();
           }
           return;
         }
@@ -1373,10 +1470,7 @@ app.get('/', (req, res) => {
         if (data.type === 'STREAM_ENDED') {
           const broadcasterId = String(data.broadcasterId || '').toLowerCase();
           if (broadcasterId && (activeBroadcasterId === broadcasterId || desiredWatchId === broadcasterId)) {
-            desiredWatchId = null;
-            closeViewerConnection(false);
-            videoEl.srcObject = null;
-            emptyState.style.display = 'block';
+            disconnectStream();
             stageTitle.innerText = 'Transmissão encerrada';
             liveBadge.style.display = 'none';
             btnDisconnect.style.display = 'none';
@@ -1387,9 +1481,14 @@ app.get('/', (req, res) => {
           return;
         }
 
-        if (data.type === 'STREAM_NOT_FOUND') {
+        if (data.type === 'STREAM_RETRY') {
+          if (data.from === desiredWatchId && (!data.sessionId || data.sessionId === activeSessionId)) scheduleViewerRecovery(500);
+          return;
+        }
+
+        if (data.type === 'STREAM_WAIT' || data.type === 'STREAM_NOT_FOUND') {
           if (desiredWatchId === String(data.targetId || '').toLowerCase()) {
-            if (viewerRecoveryAttempts > 0 && viewerRecoveryAttempts < 5) {
+            if (data.type === 'STREAM_WAIT' || viewerRecoveryAttempts > 0) {
               statusBadge.innerText = '🟡 Aguardando o transmissor reconectar...';
               scheduleViewerRecovery(1000);
             } else {
@@ -1400,12 +1499,13 @@ app.get('/', (req, res) => {
         }
 
         if (data.type === 'STOP_WATCH') {
+          senderRequests.delete(data.from);
           closeSenderPeer(data.from);
           return;
         }
 
         if (data.type === 'REQUEST_STREAM' && isSharing && localStream) {
-          await initiateStreamToViewer(data.from, Boolean(data.forceRelay), 0, String(data.codecMode || 'vp8').toLowerCase());
+          await initiateStreamToViewer(data.from, Boolean(data.forceRelay), 0, String(data.codecMode || 'vp8').toLowerCase(), data.requestId);
           return;
         }
 
@@ -1421,15 +1521,14 @@ app.get('/', (req, res) => {
 
         if (data.type === 'VIDEO_HEALTH') {
           const peer = senderPeers.get(data.from);
-          if (peer && !peer.closed) {
+          if (peer && !peer.closed && data.sessionId === peer.sessionId) {
             if (data.status === 'ready') {
               if (!peer.videoReady) {
                 peer.videoReady = true;
-                peer.targetBitrate = peer.budgetCap || perViewerBitrateBudget();
+                peer.targetBitrate = Math.min(peer.targetBitrate, peer.budgetCap || perViewerBitrateBudget());
                 await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate, false);
               }
             } else if (data.status === 'black') {
-              peer.codecMode = peer.codecMode === 'vp8' ? 'h264' : 'vp8';
               scheduleSenderPeerRecovery(data.from, peer, 100);
             }
           }
@@ -1458,25 +1557,31 @@ app.get('/', (req, res) => {
     connectWS();
 
     setInterval(() => {
+      const now = Date.now();
+      if (ws && ((ws.readyState === WebSocket.CONNECTING && now - socketOpenedAt > 15000) ||
+          (ws.readyState === WebSocket.OPEN && now - lastSocketMessageAt > 45000))) {
+        ws.close();
+        return;
+      }
       wsSend({ type: 'PING', t: Date.now() });
-    }, 15000);
+    }, 10000);
 
     window.addEventListener('online', () => {
-      allowReconnect = true;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
       connectWS();
+      if (desiredWatchId && wsSessionToken) scheduleViewerRecovery(1000);
     });
 
     window.addEventListener('offline', () => {
       setConnectionUi('offline');
+      if (ws) ws.close();
     });
 
     // --- WEBRTC: NEGOCIAÇÃO COMPATÍVEL + PERFIL DE QUALIDADE ---
-    // Não forçamos ordem de codecs. Deixamos cada navegador negociar o melhor
-    // codec em comum, o que reduz casos de conexão sem vídeo entre dispositivos.
+      // Preferimos um codec comum e preservamos os demais como alternativas.
     function waitForIceGathering(pc, timeoutMs = 3000) {
       if (!pc || pc.iceGatheringState === 'complete') return Promise.resolve(true);
 
@@ -1500,16 +1605,20 @@ app.get('/', (req, res) => {
     async function applyVideoSenderProfile(sender, targetBitrate, startupSafe = false) {
       if (!sender || !sender.track || sender.track.kind !== 'video') return;
       const bitrate = Math.max(QUALITY.minBitrate, Math.min(QUALITY.maxBitrate, Number(targetBitrate || QUALITY.safeStartBitrate)));
-      try {
-        const params = sender.getParameters();
-        if (!Array.isArray(params.encodings) || params.encodings.length === 0) params.encodings = [{}];
-        params.encodings[0].maxBitrate = bitrate;
-        params.encodings[0].maxFramerate = startupSafe ? QUALITY.safeStartFps : QUALITY.fps;
-        params.encodings[0].scaleResolutionDownBy = startupSafe ? 1.5 : 1;
-        await sender.setParameters(params);
-      } catch (err) {
-        console.warn('Ajuste RTP não suportado; usando controle nativo do navegador:', err.message);
-      }
+      const update = (senderProfileUpdates.get(sender) || Promise.resolve()).catch(() => {}).then(async () => {
+        try {
+          const params = sender.getParameters();
+          if (!Array.isArray(params.encodings) || params.encodings.length === 0) params.encodings = [{}];
+          params.encodings[0].maxBitrate = bitrate;
+          params.encodings[0].maxFramerate = bitrate < 700_000 ? 15 : (startupSafe || bitrate < 4_000_000 ? 30 : QUALITY.fps);
+          params.encodings[0].scaleResolutionDownBy = bitrate < 700_000 ? 4 : (bitrate < 2_000_000 ? 2 : (startupSafe ? 1.5 : 1));
+          await sender.setParameters(params);
+        } catch (err) {
+          console.warn('Ajuste RTP não suportado; usando controle nativo do navegador:', err.message);
+        }
+      });
+      senderProfileUpdates.set(sender, update);
+      await update;
     }
 
     function preferVideoCodec(pc, sender, codecMode = 'vp8') {
@@ -1536,7 +1645,7 @@ app.get('/', (req, res) => {
       const connectedOrRequested = Math.max(1, senderPeers.size, currentAudience.length);
       return Math.max(
         QUALITY.minBitrate,
-        Math.min(QUALITY.maxBitrate, Math.floor(STREAM_UPLOAD_BUDGET / connectedOrRequested))
+        Math.min(QUALITY.maxBitrate, Math.floor(STREAM_UPLOAD_BUDGET * 0.8 / connectedOrRequested) - 96_000)
       );
     }
 
@@ -1548,7 +1657,7 @@ app.get('/', (req, res) => {
       senderPeers.forEach((peer) => {
         if (!peer || peer.closed) return;
         peer.budgetCap = budgetCap;
-        peer.targetBitrate = peer.videoReady ? budgetCap : Math.min(QUALITY.safeStartBitrate, budgetCap);
+        peer.targetBitrate = Math.min(peer.targetBitrate, budgetCap);
         tasks.push(applyVideoSenderProfile(peer.videoSender, peer.targetBitrate, !peer.videoReady));
       });
 
@@ -1574,27 +1683,131 @@ app.get('/', (req, res) => {
     }
 
     // --- TRANSMISSÃO ---
+    function updateAudioUi() {
+      btnMic.style.display = isSharing && !streamCallMode ? 'inline-flex' : 'none';
+      btnAudio.style.display = !isSharing && desiredWatchId && desiredWatchId !== ownStreamBroadcasterId ? 'inline-flex' : 'none';
+      const micOn = Boolean(microphoneStream?.getAudioTracks().some((t) => t.readyState === 'live' && t.enabled));
+      btnMic.textContent = micOn ? 'Desativar microfone' : 'Ativar microfone';
+      btnMic.setAttribute('aria-pressed', String(micOn));
+      btnAudio.textContent = videoEl.muted ? 'Ativar áudio' : 'Silenciar áudio';
+      btnAudio.setAttribute('aria-pressed', String(!videoEl.muted));
+      if (isSharing) {
+        const systemOn = captureStream?.getAudioTracks().some((t) => t.readyState === 'live');
+        if (streamCallMode) {
+          audioStatus.textContent = (captureAudioBlocked
+            ? 'Áudio geral bloqueado para evitar retorno da call. Reinicie e escolha a aba do conteúdo com áudio.'
+            : (systemOn ? 'Áudio da aba ativo. Mantenha a call fora da aba compartilhada.' : 'Sem áudio compartilhado. Para enviar som, escolha a aba do conteúdo e marque “Compartilhar áudio”.')) +
+            ' Sua voz continua pela call. Prévia sem som.';
+        } else {
+          audioStatus.textContent = (systemOn ? 'Som da tela ativo.' : 'Sem som da tela: marque “Compartilhar áudio” no seletor ao transmitir.') +
+            (micOn ? ' Microfone ativo.' : ' Ative o microfone para transmitir sua voz.') + ' Prévia sem som. Se entrar em uma call, reinicie com o modo de call ligado.';
+        }
+      } else if (desiredWatchId === ownStreamBroadcasterId) {
+        audioStatus.textContent = 'Prévia da sua transmissão sem som para evitar retorno.';
+      } else if (!desiredWatchId) audioStatus.textContent = '';
+    }
+
+    async function toggleMicrophone() {
+      if (!isSharing || streamCallMode || btnMic.disabled) return;
+      if (microphoneStream) {
+        microphoneSource?.disconnect();
+        microphoneSource = null;
+        microphoneStream.getTracks().forEach((track) => track.stop());
+        microphoneStream = null;
+        updateAudioUi();
+        return;
+      }
+      const operation = ++audioOperation;
+      btnMic.disabled = true;
+      try {
+        await audioContext.resume();
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: false,
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        });
+        if (!isSharing || operation !== audioOperation) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        microphoneStream = stream;
+        microphoneSource = audioContext.createMediaStreamSource(stream);
+        microphoneSource.connect(audioMix);
+        stream.getAudioTracks()[0].onended = () => {
+          if (microphoneStream !== stream) return;
+          microphoneSource?.disconnect();
+          microphoneSource = null;
+          microphoneStream = null;
+          updateAudioUi();
+        };
+        updateAudioUi();
+      } catch (err) {
+        if (operation === audioOperation && isSharing) audioStatus.textContent = 'Microfone indisponível. Permita o acesso ao microfone no navegador e tente novamente.';
+      } finally {
+        if (operation === audioOperation) btnMic.disabled = false;
+      }
+    }
+
+    function releaseCapture() {
+      audioOperation += 1;
+      microphoneSource?.disconnect();
+      systemAudioSource?.disconnect();
+      microphoneSource = null;
+      systemAudioSource = null;
+      for (const stream of [localStream, captureStream, microphoneStream]) stream?.getTracks().forEach((track) => track.stop());
+      localStream = captureStream = microphoneStream = null;
+      if (audioContext) audioContext.close().catch(() => {});
+      audioContext = audioMix = null;
+      captureAudioBlocked = false;
+      btnMic.disabled = false;
+    }
+
     async function toggleShare() {
       if (isSharing) {
         stopShare();
         return;
       }
+      if (startingShare) return;
+      startingShare = true;
+      btnShare.disabled = true;
+      callMode.disabled = true;
+      streamCallMode = callMode.checked;
 
       try {
-        if (activeBroadcasterId || desiredWatchId) {
-          desiredWatchId = null;
-          closeViewerConnection(true);
-        }
-        await refreshRtcConfig(false);
-
-        localStream = await navigator.mediaDevices.getDisplayMedia({
+        // A captura precisa ser solicitada no clique, antes de qualquer espera de rede.
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        audioContext.resume().catch(() => {});
+        captureStream = await navigator.mediaDevices.getDisplayMedia({
           video: {
+            displaySurface: streamCallMode ? 'browser' : 'monitor',
             frameRate: { ideal: QUALITY.fps, max: QUALITY.fps },
             width: { ideal: QUALITY.width, max: QUALITY.width },
             height: { ideal: QUALITY.height, max: QUALITY.height }
           },
-          audio: true
+          audio: { suppressLocalAudioPlayback: false, restrictOwnAudio: true },
+          systemAudio: streamCallMode ? 'exclude' : 'include',
+          windowAudio: streamCallMode ? 'exclude' : 'system',
+          selfBrowserSurface: 'exclude',
+          surfaceSwitching: 'exclude'
         });
+
+        if (activeBroadcasterId || desiredWatchId) disconnectStream();
+        // Alguns navegadores ignoram as opções: confira a origem antes de ligar
+        // o áudio ao mix para não devolver o som do sistema à call.
+        if (streamCallMode && captureStream.getVideoTracks()[0]?.getSettings().displaySurface !== 'browser') {
+          for (const track of captureStream.getAudioTracks()) {
+            captureAudioBlocked = true;
+            track.stop();
+            captureStream.removeTrack(track);
+          }
+        }
+        audioMix = audioContext.createMediaStreamDestination();
+        if (captureStream.getAudioTracks().length) {
+          systemAudioSource = audioContext.createMediaStreamSource(new MediaStream(captureStream.getAudioTracks()));
+          systemAudioSource.connect(audioMix);
+          captureStream.getAudioTracks().forEach((track) => { track.onended = updateAudioUi; });
+        }
+        // Um único canal de áudio estável permite ligar o microfone sem renegociar os espectadores.
+        localStream = new MediaStream([...captureStream.getVideoTracks(), ...audioMix.stream.getAudioTracks()]);
 
         const videoTrack = localStream.getVideoTracks()[0];
         const audioTrack = localStream.getAudioTracks()[0];
@@ -1617,7 +1830,8 @@ app.get('/', (req, res) => {
         liveBadge.style.display = 'inline-block';
         emptyState.style.display = 'none';
 
-        videoEl.srcObject = localStream;
+        // A prévia recebe só vídeo; o áudio é enviado exclusivamente aos observadores.
+        videoEl.srcObject = new MediaStream(localStream.getVideoTracks());
         videoEl.muted = true;
         videoEl.play().catch(() => {});
 
@@ -1630,27 +1844,33 @@ app.get('/', (req, res) => {
           (turnConfigured ? 'TURN pronto' : 'P2P/STUN');
 
         if (videoTrack) videoTrack.onended = () => stopShare();
+        unmuteNotice.style.display = 'none';
+        updateAudioUi();
 
         wsSend({ type: 'LIVE_STATE_CHANGE', isLive: true });
+        refreshRtcConfig(false).catch(console.warn);
       } catch (err) {
+        releaseCapture();
         console.error('Erro ao capturar tela:', err);
         statusBadge.innerText = '⚠️ Captura cancelada ou indisponível';
+      } finally {
+        startingShare = false;
+        btnShare.disabled = false;
+        callMode.disabled = isSharing;
       }
     }
 
     function stopShare() {
       if (!isSharing && !localStream) return;
+      isSharing = false;
+      senderRequests.clear();
 
       for (const viewerId of Array.from(senderPeers.keys())) {
         closeSenderPeer(viewerId);
       }
 
-      if (localStream) {
-        localStream.getTracks().forEach((track) => {
-          try { track.stop(); } catch (_) {}
-        });
-        localStream = null;
-      }
+      releaseCapture();
+      callMode.disabled = false;
 
       isSharing = false;
       btnShare.innerText = 'Transmitir Tela';
@@ -1662,14 +1882,18 @@ app.get('/', (req, res) => {
       emptyState.style.display = 'block';
       statusBadge.innerText = '⚡ Full HD • 60 FPS • Auto';
       clearAudienceUi();
+      updateAudioUi();
 
       wsSend({ type: 'LIVE_STATE_CHANGE', isLive: false });
     }
 
-    async function initiateStreamToViewer(viewerId, forceRelay = false, recoveryAttempts = 0, codecMode = 'vp8') {
-      if (!isSharing || !localStream || !viewerId) return;
+    async function initiateStreamToViewer(viewerId, forceRelay = false, recoveryAttempts = 0, codecMode = 'vp8', requestId) {
+      if (!isSharing || !localStream || !viewerId || !requestId) return;
+      if (senderRequests.get(viewerId) === requestId) return;
+      senderRequests.set(viewerId, requestId);
 
       await refreshRtcConfig(false);
+      if (!isSharing || !localStream || senderRequests.get(viewerId) !== requestId) return;
       closeSenderPeer(viewerId);
 
       forceRelay = Boolean((forceRelay || FORCE_TURN_RELAY_POLICY) && turnConfigured);
@@ -1679,6 +1903,7 @@ app.get('/', (req, res) => {
       const peer = {
         pc,
         sessionId,
+        requestId,
         remoteReady: false,
         remoteCandidates: [],
         localCandidates: [],
@@ -1706,108 +1931,119 @@ app.get('/', (req, res) => {
 
       senderPeers.set(viewerId, peer);
 
-      const sourceVideoTrack = localStream.getVideoTracks()[0];
-      const audioTracks = localStream.getAudioTracks();
+      try {
+        const sourceVideoTrack = localStream.getVideoTracks()[0];
+        const audioTracks = localStream.getAudioTracks();
 
-      if (sourceVideoTrack) {
-        peer.videoTrackClone = sourceVideoTrack.clone();
-        if ('contentHint' in peer.videoTrackClone) peer.videoTrackClone.contentHint = 'detail';
-        peer.mediaStreamClone = new MediaStream([peer.videoTrackClone, ...audioTracks]);
-        peer.videoSender = pc.addTrack(peer.videoTrackClone, peer.mediaStreamClone);
-        preferVideoCodec(pc, peer.videoSender, peer.codecMode);
-      }
+        if (sourceVideoTrack) {
+          peer.videoTrackClone = sourceVideoTrack.clone();
+          if ('contentHint' in peer.videoTrackClone) peer.videoTrackClone.contentHint = 'detail';
+          peer.mediaStreamClone = new MediaStream([peer.videoTrackClone, ...audioTracks]);
+          peer.videoSender = pc.addTrack(peer.videoTrackClone, peer.mediaStreamClone);
+          preferVideoCodec(pc, peer.videoSender, peer.codecMode);
+        }
 
-      audioTracks.forEach((track) => pc.addTrack(track, peer.mediaStreamClone || localStream));
+        audioTracks.forEach((track) => pc.addTrack(track, peer.mediaStreamClone || localStream));
 
-      pc.onicecandidate = (event) => {
-        if (!event.candidate || peer.closed) return;
+        pc.onicecandidate = (event) => {
+          if (!event.candidate || peer.closed) return;
 
-        const packet = {
-          type: 'CANDIDATE',
-          target: viewerId,
-          sessionId,
-          candidate: event.candidate
+          const packet = {
+            type: 'CANDIDATE',
+            target: viewerId,
+            sessionId,
+            candidate: event.candidate
+          };
+
+          if (!peer.signalReady) peer.localCandidates.push(packet);
+          else wsSend(packet);
         };
 
-        if (!peer.signalReady) peer.localCandidates.push(packet);
-        else wsSend(packet);
-      };
+        const markSenderConnected = () => {
+          if (peer.closed) return;
+          peer.recoveryAttempts = 0;
+          if (peer.reconnectTimer) {
+            clearTimeout(peer.reconnectTimer);
+            peer.reconnectTimer = null;
+          }
+          if (peer.connectTimer) {
+            clearTimeout(peer.connectTimer);
+            peer.connectTimer = null;
+          }
+        };
 
-      const markSenderConnected = () => {
+        pc.onconnectionstatechange = () => {
+          if (peer.closed) return;
+          const state = pc.connectionState;
+          if (state === 'connected') markSenderConnected();
+          else if (state === 'failed') scheduleSenderPeerRecovery(viewerId, peer, 300);
+          else if (state === 'disconnected') scheduleSenderPeerRecovery(viewerId, peer, 1800);
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          if (peer.closed) return;
+          const state = pc.iceConnectionState;
+          if (state === 'connected' || state === 'completed') markSenderConnected();
+          else if (state === 'failed') scheduleSenderPeerRecovery(viewerId, peer, 300);
+        };
+
+        pc.onicecandidateerror = (event) => {
+          if (peer.closed) return;
+          console.warn('ICE sender error:', event.errorCode || '', event.errorText || '');
+        };
+
+        peer.targetBitrate = Math.min(QUALITY.safeStartBitrate, peer.budgetCap);
+        await rebalanceSenderBitrates();
+        await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate, true);
         if (peer.closed) return;
-        peer.recoveryAttempts = 0;
-        if (peer.reconnectTimer) {
-          clearTimeout(peer.reconnectTimer);
-          peer.reconnectTimer = null;
-        }
-        if (peer.connectTimer) {
-          clearTimeout(peer.connectTimer);
-          peer.connectTimer = null;
-        }
-      };
 
-      pc.onconnectionstatechange = () => {
+        const offer = await pc.createOffer();
         if (peer.closed) return;
-        const state = pc.connectionState;
-        if (state === 'connected') markSenderConnected();
-        else if (state === 'failed') scheduleSenderPeerRecovery(viewerId, peer, 300);
-        else if (state === 'disconnected') scheduleSenderPeerRecovery(viewerId, peer, 1800);
-      };
+        await pc.setLocalDescription(offer);
 
-      pc.oniceconnectionstatechange = () => {
-        if (peer.closed) return;
-        const state = pc.iceConnectionState;
-        if (state === 'connected' || state === 'completed') markSenderConnected();
-        else if (state === 'failed') scheduleSenderPeerRecovery(viewerId, peer, 300);
-      };
+        // Dá uma pequena janela para colocar candidatos ICE diretamente no SDP.
+        // Isso torna a conexão mais robusta quando o trickle ICE sofre atraso.
+        const gatheredCompletely = await waitForIceGathering(pc, peer.forceRelay ? 4500 : 2800);
 
-      pc.onicecandidateerror = (event) => {
-        if (peer.closed) return;
-        console.warn('ICE sender error:', event.errorCode || '', event.errorText || '');
-      };
-
-      peer.targetBitrate = Math.min(QUALITY.safeStartBitrate, peer.budgetCap);
-      await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate, true);
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      // Dá uma pequena janela para colocar candidatos ICE diretamente no SDP.
-      // Isso torna a conexão mais robusta quando o trickle ICE sofre atraso.
-      const gatheredCompletely = await waitForIceGathering(pc, peer.forceRelay ? 4500 : 2800);
-
-      if (peer.closed || senderPeers.get(viewerId) !== peer) return;
-
-      wsSend({
-        type: 'OFFER',
-        target: viewerId,
-        sessionId,
-        sdp: pc.localDescription,
-        quality: {
-          width: QUALITY.width,
-          height: QUALITY.height,
-          fps: QUALITY.fps,
-          maxBitrate: peer.targetBitrate
-        },
-        forceRelay: peer.forceRelay,
-        codecMode: peer.codecMode
-      });
-
-      peer.signalReady = true;
-      if (gatheredCompletely) {
-        // Os candidatos já estão no SDP; evita mandar duplicados.
-        peer.localCandidates.length = 0;
-      } else {
-        while (peer.localCandidates.length) wsSend(peer.localCandidates.shift());
-      }
-
-      // connectionState pode permanecer em 'connecting' por bastante tempo em
-      // NAT/firewall ruim. Não deixamos a tentativa travar indefinidamente.
-      peer.connectTimer = setTimeout(() => {
         if (peer.closed || senderPeers.get(viewerId) !== peer) return;
-        if (pc.connectionState === 'connected' || ['connected', 'completed'].includes(pc.iceConnectionState)) return;
-        scheduleSenderPeerRecovery(viewerId, peer, 0);
-      }, peer.forceRelay ? 14000 : 10000);
+
+        wsSend({
+          type: 'OFFER',
+          target: viewerId,
+          sessionId,
+          requestId,
+          sdp: pc.localDescription,
+          quality: {
+            width: QUALITY.width,
+            height: QUALITY.height,
+            fps: QUALITY.fps,
+            maxBitrate: peer.targetBitrate
+          },
+          forceRelay: peer.forceRelay,
+          codecMode: peer.codecMode
+        });
+
+        peer.signalReady = true;
+        if (gatheredCompletely) {
+          // Os candidatos já estão no SDP; evita mandar duplicados.
+          peer.localCandidates.length = 0;
+        } else {
+          while (peer.localCandidates.length) wsSend(peer.localCandidates.shift());
+        }
+
+        // connectionState pode permanecer em 'connecting' por bastante tempo em
+        // NAT/firewall ruim. Não deixamos a tentativa travar indefinidamente.
+        peer.connectTimer = setTimeout(() => {
+          if (peer.closed || senderPeers.get(viewerId) !== peer) return;
+          if (pc.connectionState === 'connected' || ['connected', 'completed'].includes(pc.iceConnectionState)) return;
+          scheduleSenderPeerRecovery(viewerId, peer, 0);
+        }, peer.forceRelay ? 20000 : 15000);
+      } catch (err) {
+        if (!peer.closed) {
+          console.warn('Falha ao preparar transmissão:', err.message);
+          scheduleSenderPeerRecovery(viewerId, peer, 1000);
+        }
+      }
     }
 
     function scheduleSenderPeerRecovery(viewerId, peer, delay) {
@@ -1816,20 +2052,21 @@ app.get('/', (req, res) => {
       peer.reconnectTimer = setTimeout(() => {
         peer.reconnectTimer = null;
         if (peer.closed || senderPeers.get(viewerId) !== peer || !isSharing) return;
-        const nextAttempts = Number(peer.recoveryAttempts || 0) + 1;
-        const useRelay = peer.forceRelay || (turnConfigured && nextAttempts >= 3);
-        const nextCodec = peer.codecMode || (nextAttempts >= 2 ? 'h264' : 'vp8');
-        initiateStreamToViewer(viewerId, useRelay, nextAttempts, nextCodec).catch(console.warn);
-      }, delay);
+        // O observador coordena a recuperação; duas ofertas simultâneas derrubavam a sessão.
+        wsSend({ type: 'STREAM_RETRY', target: viewerId, sessionId: peer.sessionId });
+      }, Math.max(1000, delay));
     }
 
     async function handleSenderAnswer(data) {
       const peer = senderPeers.get(data.from);
       if (!peer || peer.closed) return;
       if (data.sessionId !== peer.sessionId) return;
+      if (peer.remoteReady || peer.applyingAnswer) return;
+      peer.applyingAnswer = true;
 
       try {
         await peer.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        if (peer.closed) return;
         peer.remoteReady = true;
 
         while (peer.remoteCandidates.length) {
@@ -1838,10 +2075,13 @@ app.get('/', (req, res) => {
         }
 
         await applyVideoSenderProfile(peer.videoSender, peer.targetBitrate, true);
+        if (peer.closed) return;
         startSenderQualityManager(data.from, peer);
       } catch (err) {
         console.warn('Erro ao aplicar ANSWER:', err.message);
         scheduleSenderPeerRecovery(data.from, peer, 700);
+      } finally {
+        peer.applyingAnswer = false;
       }
     }
 
@@ -1867,6 +2107,8 @@ app.get('/', (req, res) => {
       senderPeers.delete(viewerId);
       rebalanceSenderBitrates().catch(() => {});
 
+      if (isSharing && senderPeers.size > 0) statusBadge.innerText = 'Transmitindo • ' + senderPeers.size + ' espectador(es)';
+
       if (isSharing && senderPeers.size === 0 && localStream) {
         const track = localStream.getVideoTracks()[0];
         const settings = track ? track.getSettings() : {};
@@ -1880,10 +2122,12 @@ app.get('/', (req, res) => {
       if (peer.statsTimer) clearInterval(peer.statsTimer);
 
       peer.statsTimer = setInterval(async () => {
-        if (peer.closed || peer.pc.connectionState !== 'connected') return;
+        if (peer.statsBusy || peer.closed || peer.pc.connectionState !== 'connected') return;
+        peer.statsBusy = true;
 
         try {
           const report = await peer.pc.getStats();
+          if (peer.closed) return;
           let outbound = null;
           let pair = null;
 
@@ -1966,22 +2210,27 @@ app.get('/', (req, res) => {
               '⚡ ' + width + '×' + height + ' • ' + fps + ' FPS • ' +
               mbpsText + ' • ' + senderPeers.size + ' espectador(es)' + routeText;
           }
-        } catch (_) {}
+        } catch (_) {} finally { peer.statsBusy = false; }
       }, QUALITY.statsIntervalMs);
     }
 
     // --- RECEBENDO A TRANSMISSÃO ---
     async function handleIncomingOffer(data) {
       if (!data.from || !data.sessionId || !data.sdp) return;
+      if (isSharing || data.from !== desiredWatchId || data.requestId !== watchRequestId) return;
+      if (data.sessionId === activeSessionId) return;
+      const revision = ++offerRevision;
 
       await refreshRtcConfig(false);
+      if (revision !== offerRevision || isSharing || data.from !== desiredWatchId || data.requestId !== watchRequestId) return;
+      const earlyCandidates = pendingViewerCandidates.get(data.sessionId) || [];
       closeViewerConnection(false);
 
       activeBroadcasterId = data.from;
       activeSessionId = data.sessionId;
       desiredWatchId = data.from;
       activePCRemoteReady = false;
-      activePCQueue = [];
+      activePCQueue = earlyCandidates;
       viewerLocalCandidates = [];
       viewerSignalReady = false;
       viewerVideoHealthy = false;
@@ -1995,25 +2244,18 @@ app.get('/', (req, res) => {
       const remoteMediaStream = new MediaStream();
       videoEl.autoplay = true;
       videoEl.playsInline = true;
-      videoEl.muted = true;
+      videoEl.muted = !viewerWantsAudio;
       videoEl.srcObject = remoteMediaStream;
 
       const ensureRemotePlayback = () => {
         if (activePC !== pc) return;
-        videoEl.play().catch(() => {
-          // Vídeo mutado deveria tocar automaticamente; se o navegador bloquear,
-          // mantemos a sessão ativa e permitimos interação manual.
-          unmuteNotice.style.display = 'block';
-        });
+        playViewerMedia(pc);
       };
 
       pc.ontrack = (event) => {
         if (activePC !== pc) return;
 
-        const incomingStream = event.streams && event.streams[0];
-        if (incomingStream) {
-          if (videoEl.srcObject !== incomingStream) videoEl.srcObject = incomingStream;
-        } else if (!remoteMediaStream.getTracks().some((t) => t.id === event.track.id)) {
+        if (!remoteMediaStream.getTracks().some((t) => t.id === event.track.id)) {
           remoteMediaStream.addTrack(event.track);
           if (videoEl.srcObject !== remoteMediaStream) videoEl.srcObject = remoteMediaStream;
         }
@@ -2028,7 +2270,7 @@ app.get('/', (req, res) => {
         liveBadge.style.display = 'inline-block';
         btnDisconnect.style.display = 'flex';
 
-        if (event.track.kind === 'audio') unmuteNotice.style.display = 'block';
+        updateAudioUi();
       };
 
       pc.onicecandidate = (event) => {
@@ -2047,7 +2289,6 @@ app.get('/', (req, res) => {
 
       const markViewerConnected = () => {
         if (activePC !== pc) return;
-        viewerRecoveryAttempts = 0;
         if (viewerRecoveryTimer) {
           clearTimeout(viewerRecoveryTimer);
           viewerRecoveryTimer = null;
@@ -2071,7 +2312,7 @@ app.get('/', (req, res) => {
           scheduleViewerRecovery(250);
         } else if (state === 'disconnected') {
           statusBadge.innerText = '🟡 Rede instável • tentando recuperar...';
-          scheduleViewerRecovery(1500);
+          scheduleViewerRecovery(5000);
         }
       };
 
@@ -2093,14 +2334,17 @@ app.get('/', (req, res) => {
 
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        if (activePC !== pc) return;
         activePCRemoteReady = true;
 
         while (activePCQueue.length) {
           const candidate = activePCQueue.shift();
           await pc.addIceCandidate(candidate).catch(console.warn);
+          if (activePC !== pc) return;
         }
 
         const answer = await pc.createAnswer();
+        if (activePC !== pc) return;
         await pc.setLocalDescription(answer);
         const gatheredCompletely = await waitForIceGathering(pc, useRelayOnly ? 4500 : 2800);
 
@@ -2133,6 +2377,7 @@ app.get('/', (req, res) => {
           scheduleViewerRecovery(0);
         }, useRelayOnly ? 15000 : 10000);
       } catch (err) {
+        if (activePC !== pc) return;
         console.warn('Erro ao receber OFFER:', err.message);
         scheduleViewerRecovery(700);
       }
@@ -2155,6 +2400,16 @@ app.get('/', (req, res) => {
         return;
       }
 
+      if (data.from === desiredWatchId && !isSharing) {
+        if (!pendingViewerCandidates.has(data.sessionId)) {
+          if (pendingViewerCandidates.size >= 4) pendingViewerCandidates.delete(pendingViewerCandidates.keys().next().value);
+          pendingViewerCandidates.set(data.sessionId, []);
+        }
+        const queue = pendingViewerCandidates.get(data.sessionId);
+        if (queue.length < 128) queue.push(data.candidate);
+        return;
+      }
+
       // Candidato do espectador -> transmissor.
       const peer = senderPeers.get(data.from);
       if (!peer || peer.closed || data.sessionId !== peer.sessionId) return;
@@ -2168,15 +2423,17 @@ app.get('/', (req, res) => {
 
     function scheduleViewerRecovery(delay) {
       if (!desiredWatchId || isSharing || viewerRecoveryTimer) return;
+      if (!navigator.onLine || !wsSessionToken || !ws || ws.readyState !== WebSocket.OPEN) return;
 
       viewerRecoveryAttempts += 1;
-      const backoff = Math.min(6000, delay * Math.max(1, viewerRecoveryAttempts));
+      const backoff = Math.min(15000, Math.max(delay, 750 * Math.pow(2, Math.min(viewerRecoveryAttempts - 1, 4))));
 
       viewerRecoveryTimer = setTimeout(() => {
         viewerRecoveryTimer = null;
         const target = desiredWatchId;
-        const useRelay = Boolean(turnConfigured && viewerRecoveryAttempts >= 3);
-        const codecMode = viewerRecoveryAttempts >= 2 ? 'h264' : 'vp8';
+        if (!navigator.onLine || !wsSessionToken) return;
+        const useRelay = Boolean(turnConfigured && viewerRecoveryAttempts >= 2);
+        const codecMode = viewerRecoveryAttempts % 2 ? 'h264' : 'vp8';
         closeViewerConnection(false);
         if (target) requestWatch(target, true, useRelay, codecMode);
       }, backoff);
@@ -2185,11 +2442,16 @@ app.get('/', (req, res) => {
     function startViewerFrameWatchdog(pc, broadcasterId) {
       if (viewerFrameTimer) clearInterval(viewerFrameTimer);
       const startedAt = Date.now();
-      let blackSamples = 0;
+      let lastFrames = 0;
+      let lastFrameAt = startedAt;
+      let bytesAtLastFrame = 0;
+      let busy = false;
       viewerFrameTimer = setInterval(async () => {
-        if (activePC !== pc || viewerVideoHealthy || pc.connectionState !== 'connected') return;
+        if (busy || activePC !== pc || pc.connectionState !== 'connected') return;
+        busy = true;
         try {
           const report = await pc.getStats();
+          if (activePC !== pc) return;
           let inbound = null;
           report.forEach((stat) => { if (stat.type === 'inbound-rtp' && stat.kind === 'video' && !stat.isRemote) inbound = stat; });
           if (!inbound) {
@@ -2200,18 +2462,26 @@ app.get('/', (req, res) => {
           const decoded = Number(inbound.framesDecoded || 0);
           const bytes = Number(inbound.bytesReceived || 0);
           const elementHasFrame = videoEl.videoWidth > 0 && videoEl.videoHeight > 0 && videoEl.readyState >= 2;
-          if (decoded > 0 || (received > 0 && elementHasFrame)) {
-            viewerVideoHealthy = true;
-            wsSend({ type: 'VIDEO_HEALTH', target: broadcasterId, status: 'ready', framesReceived: received, framesDecoded: decoded });
-            clearInterval(viewerFrameTimer); viewerFrameTimer = null; return;
+          const frames = inbound.framesDecoded == null && elementHasFrame ? received : decoded;
+          if (frames > lastFrames) {
+            lastFrames = frames;
+            lastFrameAt = Date.now();
+            bytesAtLastFrame = bytes;
+            if (!viewerVideoHealthy) {
+              viewerVideoHealthy = true;
+              wsSend({ type: 'VIDEO_HEALTH', target: broadcasterId, sessionId: activeSessionId, status: 'ready', framesReceived: received, framesDecoded: decoded });
+            }
+            if (Date.now() - startedAt > 15000) viewerRecoveryAttempts = 0;
           }
-          if (bytes > 0 || received > 0) blackSamples += 1;
-          if (blackSamples >= 3 || Date.now() - startedAt > 8000) {
-            wsSend({ type: 'VIDEO_HEALTH', target: broadcasterId, status: 'black', framesReceived: received, framesDecoded: decoded });
+          // Uma tela parada pode deixar de gerar quadros. Só classifica travamento
+          // após o primeiro quadro se novos dados chegaram sem decodificação.
+          if ((!viewerVideoHealthy && Date.now() - startedAt > 10000) ||
+              (Date.now() - lastFrameAt > 12000 && bytes - bytesAtLastFrame > 32000)) {
+            wsSend({ type: 'VIDEO_HEALTH', target: broadcasterId, sessionId: activeSessionId, status: 'black', framesReceived: received, framesDecoded: decoded });
             statusBadge.innerText = '⚠️ Vídeo chegou sem decodificar • trocando codec...';
             scheduleViewerRecovery(150); clearInterval(viewerFrameTimer); viewerFrameTimer = null;
           }
-        } catch (_) {}
+        } catch (_) {} finally { busy = false; }
       }, 1000);
     }
 
@@ -2226,6 +2496,7 @@ app.get('/', (req, res) => {
 
         try {
           const report = await pc.getStats();
+          if (activePC !== pc) return;
           let inbound = null;
           let pair = null;
           let localCandidate = null;
@@ -2246,7 +2517,7 @@ app.get('/', (req, res) => {
           const decodedFrames = Number(inbound.framesDecoded || 0);
           if (!viewerVideoHealthy && decodedFrames > 0) {
             viewerVideoHealthy = true;
-            wsSend({ type: 'VIDEO_HEALTH', target: activeBroadcasterId, status: 'ready', framesReceived: Number(inbound.framesReceived || 0), framesDecoded: decodedFrames });
+            wsSend({ type: 'VIDEO_HEALTH', target: activeBroadcasterId, sessionId: activeSessionId, status: 'ready', framesReceived: Number(inbound.framesReceived || 0), framesDecoded: decodedFrames });
           }
 
           const now = performance.now();
@@ -2277,7 +2548,9 @@ app.get('/', (req, res) => {
     }
 
     function closeViewerConnection(sendStop) {
-      const oldBroadcaster = activeBroadcasterId;
+      const oldBroadcaster = activeBroadcasterId || desiredWatchId;
+      offerRevision += 1;
+      pendingViewerCandidates.clear();
 
       if (viewerRecoveryTimer) {
         clearTimeout(viewerRecoveryTimer);
@@ -2319,12 +2592,15 @@ app.get('/', (req, res) => {
       activePCQueue = [];
       viewerLocalCandidates = [];
       viewerSignalReady = false;
+      videoEl.onloadedmetadata = null;
+      videoEl.onloadeddata = null;
     }
 
     function disconnectStream() {
-      desiredWatchId = null;
-      viewerRecoveryAttempts = 0;
       closeViewerConnection(true);
+      desiredWatchId = null;
+      watchRequestId = null;
+      viewerRecoveryAttempts = 0;
 
       videoEl.srcObject = null;
       emptyState.style.display = 'block';
@@ -2334,6 +2610,7 @@ app.get('/', (req, res) => {
       unmuteNotice.style.display = 'none';
       statusBadge.innerText = '⚡ Full HD • 60 FPS • Auto';
       clearAudienceUi();
+      updateAudioUi();
     }
 
     // --- COPIAR LINK DA LIVE ---
@@ -2481,18 +2758,23 @@ app.get('/', (req, res) => {
       if (!friendId || friendId === myId || isSharing) return;
 
       if (!fromReconnect) {
+        if (friendId === desiredWatchId && (activePC || viewerConnectTimer)) return;
         viewerRecoveryAttempts = 0;
         addFriendToLocal(friendId, 'Amigo#' + friendId.slice(-4));
       }
 
-      if (activeBroadcasterId && activeBroadcasterId !== friendId) {
+      if (desiredWatchId && desiredWatchId !== friendId) {
         closeViewerConnection(true);
-      }
+      } else closeViewerConnection(false);
 
       desiredWatchId = friendId;
+      if (!fromReconnect) viewerWantsAudio = friendId !== ownStreamBroadcasterId;
+      watchRequestId = createSessionId();
       currentAudienceBroadcasterId = friendId;
       if (!fromReconnect) currentAudience = [];
       renderAudience();
+      btnDisconnect.style.display = 'inline-flex';
+      updateAudioUi();
 
       const relayRequested = Boolean((forceRelay || FORCE_TURN_RELAY_POLICY) && turnConfigured);
       statusBadge.innerText = relayRequested
@@ -2500,9 +2782,14 @@ app.get('/', (req, res) => {
         : '🔄 Solicitando transmissão...';
 
       const requestedCodec = ['vp8', 'h264', 'auto'].includes(codecMode) ? codecMode : 'vp8';
-      if (!wsSend({ type: 'REQUEST_STREAM', target: friendId, forceRelay: relayRequested, codecMode: requestedCodec })) {
+      if (!wsSend({ type: 'REQUEST_STREAM', target: friendId, requestId: watchRequestId, forceRelay: relayRequested, codecMode: requestedCodec })) {
         scheduleReconnect();
+        return;
       }
+      viewerConnectTimer = setTimeout(() => {
+        viewerConnectTimer = null;
+        if (desiredWatchId === friendId) scheduleViewerRecovery(1000);
+      }, 20000);
     }
 
     function copyMyId() {
@@ -2513,10 +2800,42 @@ app.get('/', (req, res) => {
       });
     }
 
+    async function playViewerMedia(pc = activePC) {
+      if (!pc || activePC !== pc || isSharing) return;
+      try {
+        await videoEl.play();
+        if (activePC !== pc) return;
+        unmuteNotice.style.display = videoEl.muted && viewerWantsAudio ? 'block' : 'none';
+      } catch (err) {
+        if (activePC !== pc) return;
+        if (err.name === 'NotAllowedError') {
+          videoEl.muted = true;
+          unmuteNotice.style.display = 'block';
+          await videoEl.play().catch(() => {});
+        } else if (err.name !== 'AbortError') {
+          unmuteNotice.style.display = 'block';
+        }
+      }
+      updateAudioUi();
+    }
+
     function unmute() {
+      if (isSharing || desiredWatchId === ownStreamBroadcasterId) return;
+      viewerWantsAudio = true;
       videoEl.muted = false;
-      unmuteNotice.style.display = 'none';
-      videoEl.play().catch(() => {});
+      videoEl.volume = 1;
+      playViewerMedia();
+    }
+
+    function toggleViewerAudio() {
+      if (isSharing || desiredWatchId === ownStreamBroadcasterId) return;
+      if (videoEl.muted) unmute();
+      else {
+        viewerWantsAudio = false;
+        videoEl.muted = true;
+        unmuteNotice.style.display = 'none';
+        updateAudioUi();
+      }
     }
 
     function toggleFullscreen() {
@@ -2570,5 +2889,5 @@ process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.once('SIGINT', () => gracefulShutdown('SIGINT'));
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('Servidor Discord ativo na porta: ' + PORT + ' | versão ' + APP_VERSION);
+  console.log('Servidor Discord ativo na porta: ' + server.address().port + ' | versão ' + APP_VERSION);
 });
